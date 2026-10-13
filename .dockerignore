@@ -1,0 +1,13 @@
+# Never send secrets or runtime data into the image build context.
+.env
+.env.*
+!.env.example
+!.env.production.example
+data/
+node_modules/
+.git/
+.github/
+*.log
+Thumbs.db
+.DS_Store
+.vscode/

@@ -22,6 +22,30 @@ export function normaliseNumbers(text) {
   return out;
 }
 
+/** "40", "forty", "forty five", "a hundred" → number (0–999), else null. */
+export function toNumber(text) {
+  const t = String(text).trim().toLowerCase();
+  if (/^\d{1,3}$/.test(t)) return +t;
+  let total = 0;
+  let any = false;
+  for (const w of t.split(/[\s-]+/)) {
+    if (w === 'and') continue;
+    if (w === 'hundred') {
+      total = (total || 1) * 100;
+      any = true;
+      continue;
+    }
+    const v = NUMBER_WORDS[w];
+    if (v == null || w === 'a' || w === 'an') {
+      if ((w === 'a' || w === 'an') && !any) continue;
+      return null;
+    }
+    total += v;
+    any = true;
+  }
+  return any ? total : null;
+}
+
 export function stripWakeWord(text) {
   const m = WAKE_WORD_RE.exec(text);
   return m ? { matched: true, rest: text.slice(m[0].length).trim() } : { matched: false, rest: text.trim() };
@@ -177,6 +201,18 @@ const MATCHERS = [
   [/^stop(?:\s+(?:the\s+)?(?:music|song|playback|playing))?$|^(?:clear|end)\s+(?:the\s+)?(?:music|queue)$/i, () => [step('music.stop', {})]],
   [/^(?:show|display|list|what'?s in|what is in)(?:\s+me)?\s+(?:the\s+)?(?:music\s+)?queue$|^queue$/i, () => [step('music.queue', {})]],
   [/^(?:what'?s|what is)\s+(?:playing|this song|the song)(?:\s+now)?$|^now playing$/i, () => [step('music.nowplaying', {})]],
+  [
+    /^(?:set\s+(?:the\s+)?)?volume\s+(?:to\s+|at\s+)?([a-z0-9][a-z0-9 -]{0,25}?)(?:\s*(?:%|percent))?$/i,
+    (m) => {
+      const n = toNumber(m[1]);
+      return n == null ? null : [step('music.volume', { percent: Math.min(150, n) })];
+    },
+  ],
+  [/^(?:turn\s+(?:it|the\s+(?:music|volume))\s+up|volume\s+up|louder)$/i, () => [step('music.volume', { change: 20 })]],
+  [/^(?:turn\s+(?:it|the\s+(?:music|volume))\s+down|volume\s+down|quieter|softer)$/i, () => [step('music.volume', { change: -20 })]],
+  [/^shuffle(?:\s+(?:the\s+)?(?:queue|playlist|music|songs))?$/i, () => [step('music.shuffle', {})]],
+  [/^(?:stop\s+looping|loop\s+off|disable\s+loop(?:ing)?|no\s+loop)$/i, () => [step('music.loop', { mode: 'off' })]],
+  [/^(?:loop|repeat)(?:\s+(?:the\s+|this\s+)?(song|track|queue|playlist))?$/i, (m) => [step('music.loop', { mode: /queue|playlist/i.test(m[1] ?? '') ? 'queue' : 'track' })]],
   [/^play\s+(?:the\s+song\s+|me\s+)?(.+?)(?:\s+(?:song|music))?$/i, (m) => [step('music.play', { query: m[1] })]],
 
   // --- research ---

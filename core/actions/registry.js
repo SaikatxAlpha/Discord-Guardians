@@ -238,7 +238,7 @@ export const ACTIONS = {
   },
   'music.play': {
     bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false,
-    params: { query: { type: 'string', required: true, maxLength: 200 } },
+    params: { query: { type: 'string', required: true, maxLength: 300 }, pick: { type: 'boolean', default: false } },
     risk: () => RISK.LOW,
     describe: (p) => `Play "${p.query}"`,
   },
@@ -247,6 +247,19 @@ export const ACTIONS = {
   'music.resume': { bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false, params: {}, risk: () => RISK.LOW, describe: () => 'Resume music' },
   'music.stop': { bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false, params: {}, risk: () => RISK.LOW, describe: () => 'Stop music and clear queue' },
   'music.queue': { bot: 'aegis', minAuth: AUTH.MEMBER, retryable: true, params: {}, risk: () => RISK.LOW, describe: () => 'Show queue' },
+  'music.volume': {
+    bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false,
+    params: { percent: { type: 'integer', min: 0, max: 150 }, change: { type: 'integer', min: -100, max: 100 } },
+    risk: () => RISK.LOW,
+    describe: (p) => (p.percent != null ? `Set volume to ${p.percent}%` : `Change volume by ${p.change}%`),
+  },
+  'music.shuffle': { bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false, params: {}, risk: () => RISK.LOW, describe: () => 'Shuffle the queue' },
+  'music.loop': {
+    bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false,
+    params: { mode: { type: 'enum', values: ['off', 'track', 'queue'], default: 'track' } },
+    risk: () => RISK.LOW,
+    describe: (p) => `Loop: ${p.mode}`,
+  },
   'music.nowplaying': { bot: 'aegis', minAuth: AUTH.MEMBER, retryable: true, params: {}, risk: () => RISK.LOW, describe: () => 'Show current track' },
   'voice.stop_listening': { bot: 'aegis', minAuth: AUTH.TRUSTED, retryable: true, params: {}, risk: () => RISK.LOW, describe: () => 'Stop listening for ALPHA' },
   'system.status': { bot: 'any', minAuth: AUTH.MODERATOR, retryable: true, params: {}, risk: () => RISK.LOW, describe: () => 'System health status' },

@@ -5,6 +5,7 @@ import { ChannelType, PermissionsBitField } from 'discord.js';
 import { PERMISSION_TEMPLATES, ROLE_TEMPLATES } from '../../core/actions/registry.js';
 import { checkRoleManageable } from '../../core/discord/safety.js';
 import { normName } from '../../core/discord/resolve.js';
+import { isServerSupreme } from '../../core/auth.js';
 import { createJob } from '../../core/scheduler.js';
 
 const TYPE_MAP = {
@@ -15,7 +16,7 @@ const TYPE_MAP = {
   forum: ChannelType.GuildForum,
 };
 
-const isSystemOwner = (ctx, member) => member && (member.id === ctx.config.ownerId || member.id === ctx.guild.ownerId);
+const isSystemOwner = (ctx, member) => Boolean(member) && isServerSupreme(member.id, ctx.guild, ctx.config);
 
 async function actorOf(ctx) {
   return ctx.request.userId ? ctx.guild.members.fetch(ctx.request.userId).catch(() => null) : null;

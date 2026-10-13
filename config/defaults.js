@@ -32,6 +32,10 @@ export const THEME = {
 };
 
 export const DEFAULT_GUILD_SETTINGS = {
+  // Display name used on welcome cards and in templates; null = the server's own name.
+  branding: {
+    displayName: null,
+  },
   channels: {
     welcome: null,
     leave: null,
@@ -47,14 +51,35 @@ export const DEFAULT_GUILD_SETTINGS = {
     enabled: true,
     format: 'png', // png | gif | mp4 (gif/mp4 fall back to png on failure)
     message: 'Welcome to **{server}**, {mention}! You are soul #{count}.',
+    tagline: 'HAS ENTERED SOUL SOCIETY',
+    background: null, // file name under DATA_DIR/backgrounds (uploaded with /setup welcome background)
     leaveEnabled: true,
     leaveMessage: '**{name}** has departed Soul Society.',
   },
   alpha: {
-    textPrefixEnabled: true, // owner can type "ALPHA, ..." in the alpha channel
+    textPrefixEnabled: true, // owner/trusted can type "ALPHA, ..." in the alpha channel
     autoExecuteLowRisk: true,
     confirmMediumFromVoice: true,
     speakResponses: false,
+    // Besides the server owner, who may use ALPHA in this server.
+    trustedUserIds: [],
+    trustedRoleIds: [],
+  },
+  voice: {
+    language: null, // ISO-639-1 (e.g. "en", "hi"); null = deployment default (STT_LANGUAGE)
+    echoTranscripts: true, // post what ALPHA heard in the alpha channel
+    vocabulary: [], // extra words to help recognition (names, games, channels)
+    dailyLimit: null, // per-server STT cap; null = STT_GUILD_DAILY_LIMIT
+  },
+  music: {
+    volume: 70, // 0–150 %
+    announceTracks: true,
+    djRoleId: null, // if set, only this role (and admins) can skip/stop others' tracks
+  },
+  meta: {
+    firstSeenAt: null, // set when the bots first see this server (null = configured before setup guides existed)
+    knightIntroAt: null,
+    aegisIntroAt: null,
   },
   moderation: {
     enabled: true,

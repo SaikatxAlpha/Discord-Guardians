@@ -1,11 +1,14 @@
-// AEGIS ALPHA listener: joins the owner's voice channel and listens ONLY to
-// the owner/trusted users for the wake word.
+// AEGIS ALPHA listener: joins a voice channel and listens ONLY to the users
+// this server allows to use ALPHA (its owner and trusted users/roles).
 import { UtteranceCapture } from './receiver.js';
-import { canUseAlpha } from '../../core/auth.js';
 
 export class AlphaListener {
-  constructor({ hub, pipeline, config, logger, onChange = () => {} }) {
-    Object.assign(this, { hub, pipeline, config, logger, onChange });
+  /**
+   * @param {object} o
+   * @param {(guild:object, userId:string)=>boolean} o.allowSpeaker per-server speaker policy
+   */
+  constructor({ hub, pipeline, config, logger, allowSpeaker, onChange = () => {} }) {
+    Object.assign(this, { hub, pipeline, config, logger, allowSpeaker, onChange });
     this.sessions = new Map(); // guildId -> { capture, channelId, startedAt }
   }
 
@@ -33,7 +36,9 @@ export class AlphaListener {
     const capture = new UtteranceCapture({
       connection,
       logger: this.logger,
-      allow: (userId) => canUseAlpha(userId, this.config),
+      allow: (userId) => this.allowSpeaker(guild, userId),
+      silenceMs: this.config.voice.silenceMs,
+      maxUtteranceMs: this.config.voice.maxUtteranceMs,
       onUtterance: (u) =>
         this.pipeline
           .handleUtterance({ ...u, guildId: guild.id, channelId: textChannelId })

@@ -20,6 +20,7 @@ function roundRect(ctx, x, y, w, h, r) {
  * @param {{displayName:string, avatar?:Buffer|null, level:number, into:number, needed:number, rank:number, aura:number, xp:number, streak:number, title?:string|null, cyanFrame?:boolean}} p
  */
 export async function renderRankCard(p) {
+  const serverName = p.serverName ?? SERVER_NAME;
   registerFonts();
   const canvas = createCanvas(W, H);
   const ctx = canvas.getContext('2d');
@@ -125,6 +126,6 @@ export async function renderRankCard(p) {
   ctx.textAlign = 'center';
   ctx.font = '600 16px "Segoe UI Historic", "Segoe UI Symbol", "Segoe UI", sans-serif';
   ctx.fillStyle = 'rgba(226,232,240,0.6)';
-  ctx.fillText(SERVER_NAME, W / 2 + 120, H - 24);
+  ctx.fillText(sanitizeDisplayName(serverName, 48), W / 2 + 120, H - 24);
   return canvas.encode('png');
 }

@@ -1,0 +1,36 @@
+# Soul Society production stack. Secrets live in .env.production on the host
+# (never committed — see .env.production.example).
+#   docker compose up -d --build          start / update
+#   docker compose logs -f guardians      follow logs
+#   docker compose run --rm guardians node apps/register-commands.js   register slash commands
+services:
+  guardians:
+    build: .
+    image: soul-society:latest
+    container_name: soul-society
+    init: true                     # reaps ffmpeg child processes, forwards SIGTERM
+    restart: unless-stopped        # restart after crashes and host reboots
+    env_file:
+      - .env.production
+    environment:
+      APP_ENV: production
+      DATA_DIR: /app/data
+      HEALTH_PORT: ${HEALTH_PORT:-}
+    volumes:
+      - guardians-data:/app/data   # database, backups, welcome backgrounds survive re-creation
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "node", "--disable-warning=ExperimentalWarning", "scripts/healthcheck.js"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 900m
+
+volumes:
+  guardians-data:

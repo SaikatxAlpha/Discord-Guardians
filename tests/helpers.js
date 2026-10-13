@@ -1,4 +1,6 @@
 // Shared test utilities.
+// Tests never read the developer's real .env.
+process.env.SOUL_SOCIETY_NO_DOTENV = '1';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';

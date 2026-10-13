@@ -1,103 +1,82 @@
-# Implementation status (2026-10-13)
+# Implementation status (production-readiness upgrade, 2026-10-13/14)
 
-## Evidence gathered in this environment
+## Evidence from this environment
 
 | Check | Result |
 |---|---|
-| `npm test` | **97 / 97 pass.** Discord-independent: real SQLite, real rendering, MOCK Discord guild, MOCK STT. |
-| `npm run lint` | ESLint clean |
-| `npm audit --omit=dev` | 0 vulnerabilities |
-| `npm run simulate` | Full ALPHA pipeline on a MOCK guild:<br>• owner text commands, plus non-owner rejection<br>• compound commands<br>• voice via scripted MOCK transcripts<br>• approvals (approve, wrong-user, cancel)<br>• AEGIS→KNIGHT cross-process task<br>• automod in simulation mode |
-| `npm run verify:media` | **Real**, all four passed:<br>• Windows TTS produced a WAV<br>• ffmpeg decoded a local library file to 48 kHz PCM<br>• a public-domain Internet Archive recording was found, streamed and decoded live<br>• Opus encode/decode round trip |
-| Live public APIs | Hacker News, Wikipedia, Internet Archive and radio-browser responded. GDELT rate-limited one probe (429) and was reported as an unavailable source. |
-| Discord login (invalid token) | Discord rejected it, AEGIS exited with code 1 and a clear message, and the token was not in the logs |
-| Clean shutdown | Child process test: exit 0, leases released, heartbeat marked `stopped`, token redacted |
-| Welcome card | Rendered PNG (343 KB), GIF (932 KB) and MP4 (108 KB), all well under Discord's limit. Tests check the background is preserved, the avatar sits in the centre, names render dynamically and are sanitised, and every fallback works. |
+| `npm test` | **119 / 119 pass.** Real SQLite, real audio DSP and rendering; MOCK Discord guild, MOCK STT, mocked HTTP for providers. |
+| `npm run lint` | clean |
+| `npm run check:config` / `check:discord` | valid; both tokens live, Server Members + Message Content intents enabled, each bot in 1 server |
+| `npm run check:production -- --live` | 0 failures. Discord ✔, Groq key ✔ (`whisper-large-v3-turbo` available), Audius ✔, schema v2, `.env`/`data` not tracked. Warnings are only development defaults. |
+| `npm run smoke:login` | **Both bots logged in to Discord with the new code** (KNIGHT 14 commands, AEGIS 37) using a throw-away DB and no event handlers. Voice deps ok: Opus, DAVE, ffmpeg. |
+| `npm run verify:media` | **Live:** Audius search, stream decoded by ffmpeg, ffmpeg process exits after stop. Also an Internet Archive stream, Windows TTS and an Opus round trip. |
+| `npm run benchmark:stt -- --heldout` | **Live Groq**, 80 requests:<br>• old pipeline: 16.5% WER, wake word 10/20, correct command 9/20<br>• new pipeline + prompt (turbo): 2.9% WER, wake word 20/20, correct command 20/20<br>• `whisper-large-v3`: same accuracy, slower<br>Synthetic speech, not a real mic. See [VOICE.md](VOICE.md). |
+| `npm run simulate` | Full ALPHA flow on a MOCK guild, including per-server voice policy and approvals |
+| Live database | Backed up first (`data/backups/pre-production-upgrade-2026-10-13.db`), then migrated to schema v2 (adds a table and a column; existing data untouched) |
 
-**No Discord bot tokens, test server or Groq key were available**, so nothing has been verified against the live Discord API or a live speech service. Mocked Discord operations are not proof of live API success.
+## Implemented and tested
 
-## 1. Implemented and tested (offline)
+**Online music.** Provider architecture with:
 
-- **Two guardian apps** with separate tokens, client IDs, themes, commands, intents and processes. The launcher restarts a crashed bot and shuts both down cleanly.
-- **Shared ALPHA coordinator:**
-  - owner/trusted authentication
-  - per-action authority
-  - deterministic parser for every example in the brief, plus compound commands and "that channel/member" references
-  - structured action registry and validation
-  - target resolution with refusal of ambiguous matches
-  - risk classification
-  - owner-bound, expiring, single-use approvals with target-drift protection
-  - cross-bot SQLite task queue with leases and idempotency
-  - request de-duplication and audit log
-- **Persistent scheduler:** survives restarts, gives each occurrence a single run, retries with backoff and reports failures. Two processes never double-run a job.
-- **Database:** SQLite via built-in `node:sqlite`, with migrations, indexes, parameterised queries, transactions, WAL for two processes, and online backups.
-- **KNIGHT moderation:**
-  - profanity detection with obfuscation handling, Scunthorpe-style false-positive protection, and review-only handling for quotes and code
-  - flood, duplicate, mention and invite spam detection
-  - raid and new-account alerts
-  - points escalation
-  - simulation mode (default)
-  - permission, hierarchy, self, owner, protected-role and bot-loop checks
-  - verified timeout/kick/ban
-  - case history and moderation reports
-- **AEGIS administration:**
-  - channels (create, rename, delete; public, read-only or private)
-  - permission templates with an @everyone exposure check, a no-self-lockout rule and a privilege-escalation guard
-  - roles (create, assign, remove, delete, bulk) with hierarchy and privileged-role protection
-  - announcements, scheduled messages and reminders
-  - final-state verification and duplicate-name refusal
-- **Progression:**
-  - append-only ledger (enforced by triggers) with idempotent rewards
-  - message XP and aura with cooldown, duplicate detection, minimum length, diminishing returns and a daily cap
-  - voice minutes with an idle/mute/solo/AFK filter and daily cap
-  - daily and weekly rewards with streaks
-  - daily and weekly quests
-  - shop with refunds, inventory, purchase history and transfers (caps, minimum membership, idempotency)
-  - levels, level roles, leaderboards, seasons and admin grants
-  - data persists across restarts (tested)
-- **Research and reports:** sourced digest from free sources, keeping URLs and timestamps, merging corroborating stories and reporting failed sources. Optional AI synthesis is labelled as inference. Also activity analytics (counts only), activity and moderation reports, and scheduled daily research and reports.
-- **Events:** creation, Discord scheduled event (best effort), join button, reminders, exactly-once rewards, recap.
-- **Music logic:** per-guild queue, mutex, single player, skip on failure, halt on repeated failures, disconnect cleanup with persisted queue, local, Internet Archive and radio search, URL safety.
-- **Voice pipeline logic:** owner-only capture filter, wake word, arming, noise rejection, STT adapter with caps and circuit breaker, Groq request format (mocked HTTP), voice-moderation review, cap and debounce.
-- **Optional hosted AI:** Groq adapter, validated JSON plans, daily cap, circuit breaker, graceful absence.
-- **Ops:** config validation (`check:config`), live token and intent checker (`check:discord`), health report, structured logs with redaction and rotation, Windows setup, start and autostart scripts.
+- **Providers:** Audius (no key), Jamendo (optional free id), Internet Archive (CC/PD), radio (opt-in), admin direct links and `.m3u`/`.pls` playlists, optional local folder.
+- **Metadata-only links:** YouTube, Spotify and SoundCloud links resolve to a title, then the closest licensed match. Their audio is never used.
+- **Playback controls:** play, search, pause, resume, skip, stop, queue (show/remove/move), now playing with progress, volume, shuffle, loop, playlists.
+- **Reliability and isolation:**
+  - per-server isolation and a per-server mutex
+  - a global stream cap
+  - clear errors (not found, restricted, invalid link, rate limited, outage)
+  - recovery from disconnects, with the queue persisted
+  - verified ffmpeg cleanup
 
-## 2. Awaiting live Discord verification
+**Voice accuracy.** Root causes fixed:
 
-These are implemented against the discord.js / @discordjs/voice APIs, but have only run against mocks:
+- wake word dropped at the start of an utterance (domain prompt and lead-in padding)
+- pauses removed (gap restoration)
+- aliasing (FIR filter)
+- split commands dropped, and stale-stream loss
 
-- Login of both bots, presence, and slash command registration (`npm run register`) and execution
-- Real channel, role and overwrite changes and their verification, moderation actions, DMs for warnings
-- Welcome cards sent on real joins, leave messages, level-up messages and roles
-- Approval buttons, select menus and the event join button in the Discord client
-- Voice: joining channels, DAVE-encrypted audio receive, playback into a channel, TTS into a channel, disconnect recovery
-- Discord Scheduled Events creation
-- Rate-limit behaviour under load
+Plus:
 
-Suggested first live test, in order:
+- **Quality gates:** confidence (repeat / confirm), hallucination and no-speech filtering, speech detection before spending quota.
+- **Wake word:** configurable and strict.
+- **Language:** configurable per server, plus vocabulary hints.
+- **Reliability:** bounded retries (5xx/timeouts), 429 circuit breaker, global and per-server daily caps.
+- **Diagnostics:** `/voice diagnostics`, with no audio or transcripts.
 
-1. `npm run check:discord`
-2. `npm run register`
-3. `npm start`
-4. `/status`
-5. `/setup …`
-6. `/welcome-test`
-7. `ALPHA, create a test channel`
-8. `/simulate`, then automod in simulation mode
-9. `/play` with a file in `data\music`
-10. `/listen start` (needs a Groq key)
+**Multi-server.**
 
-## 3. Partially implemented or limited
+- ALPHA authority is per server (server owner and `/setup trusted` users/roles). The operator has no power elsewhere unless `OPERATOR_GLOBAL_ACCESS=true`.
+- First-run initialisation with safe defaults and a one-time setup guide per bot; existing servers are not spammed.
+- `/settings view|reset`, `/setup trusted|music|branding|welcome (tagline, uploaded background)`.
+- Per-server branding replaces the hard-coded server name.
+- Per-user rate limit.
+- No hard-coded IDs (enforced by a test).
+- Global command registration in production, and `--clear-guild`.
 
-- **Original welcome background:** the renderer is built to use it, but **the file does not exist on this PC**. I searched the empty project folder, Downloads, Pictures, Desktop, Documents, OneDrive and D:\. A labelled stand-in is used until `assets\welcome\background.png` is provided. The layout can be aligned with `assets\welcome\layout.json`.
-- **"that member"** resolves to the last member ALPHA acted on or referred to for you, kept for 30 minutes. ALPHA cannot infer someone it hasn't seen. In that case it asks you to name them.
-- **Natural language** outside the deterministic grammar needs the optional Groq key. Without it, ALPHA answers with a clarification and examples.
-- **Research quality** is a ranked headline digest. Free sources have gaps: Hacker News is tech-heavy, and GDELT allows at most one request per 5 s.
-- **Raid response** alerts the security log, and can optionally time out new accounts during a raid (off by default). It does not change server verification levels.
+**Deployment.**
 
-## 4. Blocked by free-tier, licensing or technical limits
+- Dockerfile (amd64/arm64), `docker-compose.yml` (init, restart policy, health check, named volume, log rotation, memory limit) and `.dockerignore`.
+- `.env.production.example`, `scripts/healthcheck.js`, an optional HTTP `/health`, `check:production`, `smoke:login`, a VM setup script, CI that builds the image and tests volume persistence, and [DEPLOYMENT.md](DEPLOYMENT.md).
 
-- **YouTube or Spotify playback** is not implemented. Their Terms of Service prohibit extracting or rebroadcasting audio, and no free compliant API exists. "Play Blinding Lights" works only if you own the file and put it in `data\music`. Otherwise AEGIS uses licensed Internet Archive recordings or opt-in radio.
-- **Hands-free speech recognition** depends on a hosted STT key (Groq free plan, no card). Without one, voice listening refuses to start. It has **not** been tested with real speech here.
-- **Voice moderation** consumes free STT quota per speaker. It suits small channels, not large always-on monitoring.
-- **Google News RSS** is off by default: its feed terms limit use to personal, non-commercial feed readers.
+**Preserved.** All earlier features and tests are kept:
+
+- KNIGHT's simulation default and safeguards
+- voice moderation stays off unless enabled
+- Windows `npm start`, `check:config`, `check:discord`, `register`
+
+## Requires manual testing or external action
+
+1. **Restart your bots on the new code.** Your current `npm start` session is running the old code. Stop it (Ctrl+C), then run `npm start`.
+2. **Live voice in a channel:** follow the manual procedure in [VOICE.md](VOICE.md#manual-end-to-end-test-needs-a-real-voice-channel). Accuracy with your real microphone has not been measured.
+3. **Live music playback in a voice channel:** the stream is verified up to Discord-format PCM; audio heard in Discord has not been confirmed.
+4. **Container build:** Docker isn't installed on this PC. The image build and the volume-persistence check are automated in GitHub Actions (`.github/workflows/ci.yml`) and run when you push. Until then, "containers build successfully" is **unverified**.
+5. **Remote deployment:** needs a host account (e.g. Oracle Cloud Always Free; card verification required) and the steps in DEPLOYMENT.md. **The bots are not deployed and not 24/7 yet.**
+6. **Second-server test:** invite both bots to another server and check the setup guide, `/settings view` and `/play`.
+7. **Jamendo:** needs a free `JAMENDO_CLIENT_ID`; tested only with mocked responses.
+
+## Limitations (by terms or technology)
+
+- **Mainstream label music** (e.g. "Her" by JVKE) isn't available from any free licensed source. YouTube's developer policies forbid separating audio or background play, and Spotify/SoundCloud don't license rebroadcasting.
+- **No free 24/7 host without a card** was found (checked 2026-10-13). Oracle Always Free is ₹0 within limits but needs card verification and can reclaim idle VMs. Google's `e2-micro` has only 1 GB/month free egress.
+- **Speech recognition can still make mistakes** (accents, noise, names). The confirmation gates exist for this.
+- **Windows TTS** (spoken replies) works only on Windows hosts and is disabled in the Linux container.

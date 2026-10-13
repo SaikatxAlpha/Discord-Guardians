@@ -41,9 +41,11 @@ notepad .env
 
 Minimum settings:
 
-- `OWNER_ID`: your user ID. In Discord, enable Developer Mode (*Settings → Advanced*), then right-click your name → *Copy User ID*.
 - `KNIGHT_TOKEN`, `AEGIS_TOKEN`: one token per application.
-- `DEV_GUILD_ID`: your server's ID (right-click the server icon → *Copy Server ID*). With this set, slash commands appear instantly in that server.
+- `DEV_GUILD_ID` (development only): your test server's ID (right-click the server icon → *Copy Server ID*). With this set, slash commands appear instantly in that server. Production registers commands globally and ignores it.
+- `OWNER_ID` (optional): your user ID as the bot operator (enable Developer Mode in *Settings → Advanced*, then right-click your name → *Copy User ID*). You don't need it to control ALPHA in **your own** server: every server's owner automatically controls ALPHA there, and owners can trust others with `/setup trusted`.
+
+For running 24/7 on a server instead of your PC, see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 Optional settings:
 

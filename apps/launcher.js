@@ -65,3 +65,19 @@ function shutdown() {
 
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.on(sig, shutdown);
 for (const bot of bots) launch(bot);
+
+// Optional HTTP health endpoint for hosts that probe a port (HEALTH_PORT).
+// It exposes only guardian status — no settings, IDs or secrets.
+const healthPort = getConfig().healthPort;
+if (healthPort) {
+  const { createServer } = await import('node:http');
+  const { checkHealth } = await import('../scripts/healthcheck.js');
+  createServer((req, res) => {
+    if (req.url !== '/health' && req.url !== '/') {
+      res.writeHead(404).end();
+      return;
+    }
+    const r = checkHealth({ dbPath: getConfig().dbPath, bots });
+    res.writeHead(r.ok ? 200 : 503, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ok: r.ok, bots: r.bots.map((b) => ({ bot: b.bot, status: b.status, healthy: b.healthy })) }));
+  }).listen(healthPort, () => console.log(`[launcher] health endpoint on :${healthPort}/health`));
+}

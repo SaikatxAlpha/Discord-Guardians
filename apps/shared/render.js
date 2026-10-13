@@ -20,7 +20,7 @@ export function renderResponse(bot, res) {
       const embed = guardianEmbed(bot, {
         title: 'Confirmation required',
         color: STATUS_COLORS.pending,
-        description: `${safeText(res.summary, 3000)}\n\n**Risk:** ${res.risk.toUpperCase()}\n**Requested by:** <@${a.owner_id}> (only they can approve)\n**Expires:** <t:${Math.floor(a.expires_at / 1000)}:R>`,
+        description: `${res.heard ? `🎙️ Heard: “${safeText(res.heard, 300)}”${res.confidence != null ? ` (${Math.round(res.confidence * 100)}% confidence)` : ''}\n\n` : ''}${safeText(res.summary, 3000)}\n\n**Risk:** ${res.risk.toUpperCase()}\n**Requested by:** <@${a.owner_id}> (only they can approve)\n**Expires:** <t:${Math.floor(a.expires_at / 1000)}:R>`,
         fields: res.warnings?.length ? [{ name: '⚠️ Warnings', value: res.warnings.map((w) => `• ${w}`).join('\n') }] : [],
       });
       return { embeds: [embed], components: [approvalButtons(a.id)] };

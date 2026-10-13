@@ -4,7 +4,7 @@ import { THEME, SERVER_NAME, PROJECT_NAME } from '../../config/defaults.js';
 
 export function guardianEmbed(bot, { title, description, fields, color, footer, thumbnail, image, timestamp = true } = {}) {
   const t = THEME[bot] ?? THEME.aegis;
-  const e = new EmbedBuilder().setColor(color ?? t.color).setFooter({ text: footer ?? `${t.name} • ${t.title} • ${SERVER_NAME}` });
+  const e = new EmbedBuilder().setColor(color ?? t.color).setFooter({ text: footer ?? `${t.name} • ${t.title}` });
   if (title) e.setTitle(`${t.emoji} ${title}`.slice(0, 256));
   if (description) e.setDescription(String(description).slice(0, 4096));
   if (fields?.length) e.addFields(fields.slice(0, 25).map((f) => ({ name: String(f.name).slice(0, 256), value: String(f.value || '—').slice(0, 1024), inline: Boolean(f.inline) })));

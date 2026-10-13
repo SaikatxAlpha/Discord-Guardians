@@ -3,6 +3,21 @@ import { DEFAULT_GUILD_SETTINGS } from '../config/defaults.js';
 
 const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
 
+/** Settings whose default is null but whose value is not a string. */
+const NULLABLE_TYPES = { 'voice.dailyLimit': 'number' };
+
+/** Remove all overrides for a server (back to defaults). */
+export function resetGuildSettings(db, guildId) {
+  db.run('DELETE FROM guild_settings WHERE guild_id = ?', guildId);
+}
+
+/** Create the settings row for a newly joined server (idempotent). Returns true if it was new. */
+export function initGuildSettings(db, guildId) {
+  const data = JSON.stringify({ meta: { firstSeenAt: new Date().toISOString() } });
+  const r = db.run(`INSERT OR IGNORE INTO guild_settings (guild_id, data, updated_at) VALUES (?, ?, ?)`, guildId, data, Date.now());
+  return r.changes === 1;
+}
+
 export function deepMerge(base, over) {
   if (!isObj(over)) return structuredClone(base);
   const out = structuredClone(base);
@@ -44,13 +59,12 @@ function defaultAt(path) {
 export function setGuildSetting(db, guildId, path, value) {
   const def = defaultAt(path);
   if (def === undefined) throw new Error(`Unknown setting "${path}"`);
-  const expected = def === null ? 'nullable-string' : Array.isArray(def) ? 'array' : typeof def;
-  const ok =
-    expected === 'nullable-string'
-      ? value === null || typeof value === 'string'
-      : expected === 'array'
-        ? Array.isArray(value)
-        : typeof value === expected;
+  const expected = def === null ? `nullable-${NULLABLE_TYPES[path] ?? 'string'}` : Array.isArray(def) ? 'array' : typeof def;
+  const ok = expected.startsWith('nullable-')
+    ? value === null || typeof value === expected.slice('nullable-'.length)
+    : expected === 'array'
+      ? Array.isArray(value)
+      : typeof value === expected;
   if (!ok) throw new Error(`Setting "${path}" expects ${expected}`);
   db.transaction(() => {
     const data = readOverrides(db, guildId);

@@ -122,6 +122,15 @@ export class MockChannel {
       this.permissionOverwrites.cache.set(o.id, { id: o.id, allow: new PermissionsBitField(o.allow ?? []), deny: new PermissionsBitField(o.deny ?? []) });
     }
   }
+  isTextBased() {
+    return this.type === ChannelType.GuildText || this.type === ChannelType.GuildAnnouncement;
+  }
+  isThread() {
+    return false;
+  }
+  get rawPosition() {
+    return [...this.guild.channels.cache.keys()].indexOf(this.id);
+  }
   permissionsFor(member) {
     const base = member.permissions;
     if (base.has('Administrator')) return new PermissionsBitField(ALL);

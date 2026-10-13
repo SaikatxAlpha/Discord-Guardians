@@ -77,17 +77,26 @@ export class VoiceModerator {
       allow: (userId) => {
         const m = guild.members.cache.get(userId);
         const s = getGuildSettings(this.db, guild.id).moderation;
-        return Boolean(m && !m.user.bot && userId !== this.config.ownerId && !s.exemptRoleIds.some((r) => m.roles.cache.has(r)));
+        return Boolean(m && !m.user.bot && userId !== guild.ownerId && !s.exemptRoleIds.some((r) => m.roles.cache.has(r)));
       },
+      silenceMs: this.config.voice?.silenceMs,
+      maxUtteranceMs: this.config.voice?.maxUtteranceMs,
       onUtterance: async (u) => {
-        if (u.durationMs < 500 || u.rms < 0.01) return;
+        if (u.durationMs < 500 || (u.speechMs ?? 1000) < 300) return; // no real speech: do not spend quota
         try {
-          const tr = await this.stt.transcribe(u.wav, { durationMs: u.durationMs });
+          const vs = getGuildSettings(this.db, guild.id).voice;
+          const tr = await this.stt.transcribe(u.wav, {
+            durationMs: u.durationMs,
+            guildId: guild.id,
+            language: vs.language ?? undefined,
+            guildLimit: vs.dailyLimit ?? this.config.stt?.guildDailyLimit,
+          });
+          if (tr.hallucination || (tr.noSpeech ?? 0) > 0.6) return;
           const member = guild.members.cache.get(u.userId) ?? (await guild.members.fetch(u.userId).catch(() => null));
           if (!member) return;
           await this.pipeline.handleTranscript({ guildId: guild.id, channelId, userId: u.userId, text: tr.text, confidence: tr.confidence, member, guild });
         } catch (err) {
-          this.logger.warn('voice moderation transcription failed', { err: err.message });
+          this.logger.warn('voice moderation transcription failed', { code: err.code ?? null });
         }
       },
     });

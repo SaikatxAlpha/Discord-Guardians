@@ -6,6 +6,7 @@ import { enforce, recordCase } from './enforce.js';
 import { sendToChannel } from '../../core/discord/send.js';
 import { guardianEmbed, STATUS_COLORS, safeText } from '../../core/discord/theme.js';
 import { getGuildSettings } from '../../core/settings.js';
+import { isServerSupreme } from '../../core/auth.js';
 
 export class AutoModerator {
   constructor({ db, config, logger }) {
@@ -31,7 +32,7 @@ export class AutoModerator {
 
   isExempt(member, channelId, mod) {
     if (!member) return true;
-    if (member.id === this.config.ownerId || member.id === member.guild?.ownerId) return true;
+    if (isServerSupreme(member.id, member.guild, this.config)) return true;
     if (mod.exemptChannelIds.includes(channelId)) return true;
     if (mod.exemptRoleIds.some((id) => member.roles.cache.has(id))) return true;
     if (mod.exemptModerators && (member.permissions.has('ManageMessages') || member.permissions.has('ModerateMembers'))) return true;

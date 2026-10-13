@@ -99,7 +99,22 @@ test('welcome message templates escape user-controlled text', () => {
   assert.match(out, /<@123456789012345678>/);
   assert.ok(!/@everyone/.test(out.replace('@\u200Beveryone', '')));
   assert.match(out, /\\\*\\\*bold\\\*\\\*/);
-  assert.match(out, /𓆩 𝐕𝐎𝐈𝐃𝐖𝐎𝐑𝐊𝐒 𓆪/);
+  assert.match(out, /to G \(#42\)/, '{server} is the current server, not a hard-coded name');
+  const branded = formatTemplate('{server}', { member, guild: { name: 'G' }, settings: { branding: { displayName: '𓆩 𝐕𝐎𝐈𝐃𝐖𝐎𝐑𝐊𝐒 𓆪' } } });
+  assert.equal(branded, '𓆩 𝐕𝐎𝐈𝐃𝐖𝐎𝐑𝐊𝐒 𓆪');
+});
+
+test('each server gets its own branding, tagline and background on the card', async () => {
+  const dir = tempDir();
+  const config = { ...testConfig(), dataDir: dir };
+  const { backgroundFor } = await import('../features/welcome/handler.js');
+  fs.mkdirSync(path.join(dir, 'backgrounds'));
+  fs.writeFileSync(path.join(dir, 'backgrounds', '123.png'), await solidPng(1200, 500, '#103050'));
+  assert.equal(backgroundFor(config, { welcome: { background: '123.png' } }), path.join(dir, 'backgrounds', '123.png'));
+  assert.equal(backgroundFor(config, { welcome: { background: '../../etc/passwd' } }), backgroundFor(config, {}), 'path traversal ignored');
+  const a = await renderWelcomePng({ avatar: null, displayName: 'X', serverName: 'Server A', tagline: 'JOINED THE GUILD' });
+  const b = await renderWelcomePng({ avatar: null, displayName: 'X', serverName: 'Server B', tagline: 'HAS ENTERED SOUL SOCIETY' });
+  assert.notDeepEqual(a.buffer, b.buffer);
 });
 
 test('join handler sends the card to the configured channel and survives an invalid channel id', async () => {

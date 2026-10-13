@@ -16,6 +16,12 @@ import { enqueueTask, waitForTask, claimRequest } from './taskQueue.js';
 import { getGuildSettings } from './settings.js';
 import { normName } from './discord/resolve.js';
 
+/** Low-impact actions that may run without confirmation even when a voice transcript is uncertain. */
+const SAFE_WHEN_UNCERTAIN = new Set([
+  'system.help', 'system.status', 'music.play', 'music.skip', 'music.pause', 'music.resume', 'music.stop', 'music.queue',
+  'music.nowplaying', 'music.volume', 'music.shuffle', 'music.loop', 'report.activity', 'report.moderation', 'research.run', 'voice.stop_listening',
+]);
+
 /** Steps that produce a context reference usable by later steps. */
 const PRODUCES = { 'channel.create': 'channel', 'role.create': 'role' };
 
@@ -36,11 +42,11 @@ export class AlphaCoordinator {
   /** Natural-language entry point (typed "ALPHA, ..." or a voice transcript). */
   async handleText(req) {
     if (!claimRequest(this.db, req.requestId, this.bot)) return { status: 'duplicate', message: 'Already handled.' };
-    // 1. Identity verification. The wake word is not authentication.
-    const level = authLevel({ userId: req.userId, config: this.config });
+    // 1. Identity verification against THIS server's policy. The wake word is not authentication.
+    const level = await this.levelFor(req);
     if (level < AUTH.TRUSTED) {
       this.audit(req, 'alpha.denied', { outcome: 'denied', detail: 'not owner/trusted' });
-      return { status: 'rejected', message: 'ALPHA only accepts commands from the Soul Society owner.' };
+      return { status: 'rejected', message: "ALPHA only accepts commands from this server's owner or users/roles it has trusted (/setup trusted)." };
     }
     // 2. Intent resolution: deterministic first, hosted AI only as a fallback.
     let parsed = parseCommand(req.text, { tz: this.config.timezone });
@@ -62,10 +68,10 @@ export class AlphaCoordinator {
   /** Structured entry point (slash commands, and the natural-language path above). */
   async handleSteps(req, steps, { dedupe = true } = {}) {
     if (dedupe && !claimRequest(this.db, req.requestId, this.bot)) return { status: 'duplicate', message: 'Already handled.' };
-    const level = req.level ?? authLevel({ userId: req.userId, config: this.config, member: req.member });
-    req = { ...req, level };
     const guild = await this.getGuild(req.guildId);
     if (!guild) return { status: 'error', message: 'This command must be used inside the server.' };
+    const level = req.level ?? (await this.levelFor(req, guild));
+    req = { ...req, level };
 
     // 3. Structured plan with validation and per-action authorisation.
     const plan = [];
@@ -86,7 +92,7 @@ export class AlphaCoordinator {
     if (!prepared.ok) return { status: 'clarify', message: prepared.error };
 
     // 6. Optional confirmation.
-    if (this.needsConfirmation(prepared.maxRisk, req)) {
+    if (this.needsConfirmation(prepared.maxRisk, req, plan)) {
       const summary = prepared.resolved.map((r, i) => `${i + 1}. ${getAction(r.step.action).describe(r.step.params)}`).join('\n');
       const approval = createApproval(this.db, {
         guildId: req.guildId,
@@ -99,12 +105,23 @@ export class AlphaCoordinator {
         ttlMs: this.config.approvalTtlMs,
       });
       this.audit(req, 'approval.requested', { outcome: 'pending', params: plan, detail: approval.id });
-      return { status: 'awaiting_approval', approval, summary, warnings: prepared.warnings, risk: RISK_NAMES[prepared.maxRisk] };
+      return { status: 'awaiting_approval', approval, summary, warnings: prepared.warnings, risk: RISK_NAMES[prepared.maxRisk], heard: req.heard ?? null, confidence: req.confidence ?? null };
     }
     return this.execute(guild, req, prepared.resolved, null);
   }
 
-  needsConfirmation(risk, req) {
+  /** Authority of the requester in the request's server (owner, trusted users/roles, Discord permissions). */
+  async levelFor(req, guild = null) {
+    const g = guild ?? (await this.getGuild(req.guildId));
+    const member = req.member ?? (g ? g.members.cache.get(req.userId) ?? (await g.members.fetch(req.userId).catch(() => null)) : null);
+    const settings = req.guildId ? getGuildSettings(this.db, req.guildId) : null;
+    return authLevel({ userId: req.userId, config: this.config, member, guild: g, settings });
+  }
+
+  needsConfirmation(risk, req, plan = []) {
+    // An uncertain voice transcript is confirmed before anything that changes
+    // the server; harmless music/query commands stay one-step.
+    if (req.forceConfirm && (risk >= RISK.MEDIUM || plan.some((s) => !SAFE_WHEN_UNCERTAIN.has(s.action) || (s.action === 'research.run' && s.params.channel)))) return true;
     if (risk >= RISK.CRITICAL) return true;
     if (risk >= RISK.HIGH && req.source !== 'slash') return true;
     if (risk >= RISK.MEDIUM && req.source === 'voice') {
@@ -252,7 +269,7 @@ function snapshotOf(r) {
 }
 
 function pickRequest(req) {
-  return { requestId: req.requestId, guildId: req.guildId, userId: req.userId, channelId: req.channelId, source: req.source, via: req.via, level: req.level };
+  return { requestId: req.requestId, guildId: req.guildId, userId: req.userId, channelId: req.channelId, source: req.source, via: req.via, level: req.level, heard: req.heard };
 }
 
 export function humanError(err) {

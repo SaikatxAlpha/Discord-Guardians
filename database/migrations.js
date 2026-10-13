@@ -346,6 +346,21 @@ CREATE TABLE heartbeats (
 );
 `,
   },
+  {
+    version: 2,
+    name: 'per-guild usage limits and voice/music state',
+    sql: `
+-- Per-server usage counters (STT requests etc.) so one server cannot exhaust a shared quota.
+CREATE TABLE guild_usage (
+  day TEXT NOT NULL,
+  guild_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, guild_id, kind)
+);
+ALTER TABLE music_state ADD COLUMN settings TEXT NOT NULL DEFAULT '{}';
+`,
+  },
 ];
 
 export function runMigrations(db) {

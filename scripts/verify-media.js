@@ -2,7 +2,8 @@
 //  1. Windows TTS → WAV
 //  2. ffmpeg decode of a local library file to Discord-format PCM (48 kHz stereo s16le)
 //  3. Internet Archive: search a licensed recording, resolve and stream real audio through ffmpeg
-//  4. Opus encode → decode round trip (the codec path used by the voice receiver)
+//  4. Audius: licensed online search, live stream decode, ffmpeg process cleanup
+//  5. Opus encode → decode round trip (the codec path used by the voice receiver)
 // Usage: npm run verify:media
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,9 +11,11 @@ import path from 'node:path';
 import prism from 'prism-media';
 import { synthesize, ttsAvailable } from '../features/voice/tts.js';
 import { ffmpegStream } from '../features/music/discordAdapter.js';
-import { searchLocal, searchArchive, resolveArchiveStream } from '../features/music/providers.js';
-import { downsampleTo16kMono, rmsLevel } from '../features/voice/audio.js';
+import { searchLocal, searchArchive, resolveArchiveStream, searchTracks, streamInput } from '../features/music/providers.js';
+import { loadEnv, getConfig } from '../config/env.js';
+import { downsampleTo16kMono, rmsLevel, pcmToWav } from '../features/voice/audio.js';
 
+loadEnv();
 const results = [];
 const check = async (name, fn) => {
   const t = Date.now();
@@ -50,9 +53,15 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soul-media-'));
 let wavPath;
 
 await check('Windows TTS synthesis', async () => {
-  if (!ttsAvailable()) throw new Error('not Windows');
-  const wav = await synthesize('This is Aegis, testing the music pipeline.');
   wavPath = path.join(dir, 'Test Artist - Guardian Test Song.wav');
+  if (!ttsAvailable()) {
+    // Not Windows (e.g. the Linux container): use a generated tone for the next check.
+    const tone = Buffer.alloc(16000 * 2);
+    for (let i = 0; i < 16000; i++) tone.writeInt16LE(Math.round(Math.sin((2 * Math.PI * 440 * i) / 16000) * 8000), i * 2);
+    fs.writeFileSync(wavPath, pcmToWav(tone));
+    return 'SKIPPED (Windows speech engine not available on this OS; used a test tone instead)';
+  }
+  const wav = await synthesize('This is Aegis, testing the music pipeline.');
   fs.writeFileSync(wavPath, wav);
   return `${wav.length} bytes WAV`;
 });
@@ -73,6 +82,19 @@ await check('Internet Archive licensed search + live stream decode', async () =>
   const url = await resolveArchiveStream(track);
   const pcm = await readPcm(ffmpegStream(url, { remote: true }), 48000 * 4 * 2, 30000);
   return `"${track.title}" (${track.license}) → ${pcm.length} bytes decoded from ${new URL(url).hostname}`;
+});
+
+await check('Audius online search + live stream decode + ffmpeg cleanup', async () => {
+  const config = getConfig();
+  const { results, failed } = await searchTracks('lofi chill beats', { config: { ...config, music: { ...config.music, providers: ['audius'] } } });
+  if (!results.length) throw new Error(`no Audius results${failed.length ? ` (${failed[0].code})` : ''}`);
+  const track = results[0];
+  const ff = ffmpegStream(await streamInput(track), { remote: true });
+  const exited = new Promise((r) => ff.process.once('exit', r));
+  const pcm = await readPcm(ff, 48000 * 4 * 2, 30000);
+  const level = rmsLevel(downsampleTo16kMono(pcm));
+  await Promise.race([exited, new Promise((_, rej) => setTimeout(() => rej(new Error('ffmpeg process did not exit after destroy')), 5000))]);
+  return `"${track.title}" by ${track.artist} (${track.license}) → ${pcm.length} bytes PCM, rms ${level.toFixed(3)}; ffmpeg exited after stop`;
 });
 
 await check('Opus encode → decode round trip (opusscript)', async () => {

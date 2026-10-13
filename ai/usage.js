@@ -20,6 +20,28 @@ export function reserveUsage(db, provider, kind, limit, units = 0, now = Date.no
   });
 }
 
+/** Per-server daily counter; returns false once `limit` is reached for that server. */
+export function reserveGuildUsage(db, guildId, kind, limit, now = Date.now()) {
+  if (!guildId || !limit) return true;
+  const day = dayKey(now, 'UTC');
+  return db.transaction(() => {
+    const row = db.get('SELECT count FROM guild_usage WHERE day = ? AND guild_id = ? AND kind = ?', day, guildId, kind);
+    if (row && row.count >= limit) return false;
+    db.run(
+      `INSERT INTO guild_usage (day, guild_id, kind, count) VALUES (?, ?, ?, 1)
+       ON CONFLICT(day, guild_id, kind) DO UPDATE SET count = count + 1`,
+      day,
+      guildId,
+      kind,
+    );
+    return true;
+  });
+}
+
+export function guildUsageToday(db, guildId, kind, now = Date.now()) {
+  return db.get('SELECT count FROM guild_usage WHERE day = ? AND guild_id = ? AND kind = ?', dayKey(now, 'UTC'), guildId, kind)?.count ?? 0;
+}
+
 export function usageToday(db, provider, kind, now = Date.now()) {
   const row = db.get('SELECT requests, units FROM provider_usage WHERE day = ? AND provider = ? AND kind = ?', dayKey(now, 'UTC'), provider, kind);
   return row ?? { requests: 0, units: 0 };

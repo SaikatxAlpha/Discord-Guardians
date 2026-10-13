@@ -7,6 +7,7 @@ import { knightHandlers } from '../../features/moderation/handlers.js';
 import { enforce } from '../../features/moderation/enforce.js';
 import { VoiceModerator } from '../../features/voice/voiceModeration.js';
 import { knightCommands } from './commands.js';
+import { guardianEmbed } from '../../core/discord/theme.js';
 
 export const KNIGHT_INTENTS = [
   GatewayIntentBits.Guilds,
@@ -32,6 +33,21 @@ export function createKnight() {
 
   app.client.on(Events.MessageCreate, (m) => automod.onMessage(m).catch((err) => app.logger.error('automod failed', { err })));
   app.client.on(Events.GuildMemberAdd, (m) => automod.onMemberJoin(m).catch((err) => app.logger.error('raid check failed', { err })));
+  app.introMessage = () =>
+    guardianEmbed('knight', {
+      title: 'KNIGHT has arrived',
+      description: [
+        'I protect this server: automod (profanity, spam, raids), moderation commands, case history and security logs.',
+        '',
+        '**Safe by default:** automod starts in **simulation mode** — it only logs what it would do. Voice moderation is **off**.',
+        '**Next steps (admins):**',
+        '1. `/modconfig logs` — choose private security and case-log channels.',
+        '2. Watch `/simulate` and the logs, then `/modconfig simulate enabled:false` when ready.',
+        '3. Move my role above the roles I should moderate.',
+        '',
+        'Commands: `/warn` `/timeout` `/kick` `/ban` `/cases` `/modreport` `/knight-status`',
+      ].join('\n'),
+    });
   app.onShutdown = async () => {
     automod.stop();
     voiceMod.stopAll();
@@ -39,7 +55,7 @@ export function createKnight() {
   return app;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   createKnight()
     .start()
     .catch((err) => {

@@ -10,6 +10,7 @@ import { AlphaCoordinator } from '../core/coordinator.js';
 import { claimTask, completeTask } from '../core/taskQueue.js';
 import { getGuildSettings, setGuildSetting } from '../core/settings.js';
 import { memoryLogger } from '../core/logger.js';
+import { canUseAlpha } from '../core/auth.js';
 import { knightHandlers } from '../features/moderation/handlers.js';
 import { serverHandlers } from '../features/server/handlers.js';
 import { systemHandlers } from '../apps/shared/systemHandlers.js';
@@ -67,7 +68,13 @@ const stt = new MockSTT([
   'Alpha, timeout Bob for five minutes',
   'Alpha, ban that member',
 ]);
-const voice = new VoicePipeline({ stt, config, handleCommand: (r) => aegis.handleText(r) });
+// Same per-server speaker policy as AEGIS: the server owner and trusted users/roles.
+const voice = new VoicePipeline({
+  stt,
+  config,
+  authorize: (u) => canUseAlpha(u.userId, config, { guild, settings: getGuildSettings(aegisDb, guild.id), member: guild.members.cache.get(u.userId) }),
+  handleCommand: (r) => aegis.handleText(r),
+});
 const wav = pcmToWav(Buffer.alloc(32000));
 const speak = async (userId, label) => {
   const r = await voice.handleUtterance({ guildId: guild.id, channelId: env.channels.alpha.id, userId, wav, durationMs: 1500, rms: 0.1 });

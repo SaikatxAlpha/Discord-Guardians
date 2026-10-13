@@ -14,7 +14,7 @@ const memberRef = (u) => `<@${u.id}>`;
 const eph = { flags: MessageFlags.Ephemeral };
 
 function requireAdmin(interaction, app) {
-  if (authLevel({ userId: interaction.user.id, config: app.config, member: interaction.member }) < AUTH.ADMIN) {
+  if (authLevel({ userId: interaction.user.id, config: app.config, member: interaction.member, guild: interaction.guild, settings: getGuildSettings(app.db, interaction.guildId) }) < AUTH.ADMIN) {
     interaction.reply({ content: 'You need Manage Server permission for this.', ...eph });
     return false;
   }

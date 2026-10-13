@@ -5,6 +5,7 @@ import { getAction, RISK } from './registry.js';
 import { resolveChannel, resolveMember, resolveRole, resolveTarget, normName } from '../discord/resolve.js';
 import { dangerousPermissionsOf } from '../discord/safety.js';
 import { getRef } from '../context.js';
+import { isServerSupreme } from '../auth.js';
 
 const CONTEXT_TOKENS = { $last_channel: 'channel', $last_member: 'member', $last_role: 'role' };
 
@@ -57,17 +58,30 @@ export async function resolveStep({ guild, step, request, db, config, pendingRef
   let risk = def.risk(params, request);
   if (deferred) return { ok: true, step: { action: step.action, params }, risk, warnings, deferred: true };
 
+  // Never let a loose fuzzy match pick the target of a sensitive action:
+  // high-risk actions need an exact name (or mention/ID); voice commands
+  // never accept typo-tolerant matches.
+  const minScore = risk >= RISK.HIGH ? 100 : request.source === 'voice' ? 60 : 0;
+  const fuzzyNote = (label, score) => {
+    if (score != null && score < 100) {
+      warnings.push(`Matched "${label}" by partial name.`);
+      if (request.source === 'voice') risk = Math.max(risk, RISK.MEDIUM);
+    }
+  };
+
   for (const f of CHANNEL_FIELDS) {
     if (!params[f]) continue;
-    const r = await resolveChannel(guild, params[f], f === 'category' ? { types: ['category'] } : undefined);
+    const r = await resolveChannel(guild, params[f], f === 'category' ? { types: ['category'], minScore } : { minScore });
     if (!r.ok) return { ok: false, error: r.error };
+    fuzzyNote(channelLabel(r.channel), r.score);
     params[`${f}Id`] = r.channel.id;
     params[`${f}Label`] = channelLabel(r.channel);
   }
   for (const f of ROLE_FIELDS) {
     if (!params[f]) continue;
-    const r = await resolveRole(guild, params[f]);
+    const r = await resolveRole(guild, params[f], { minScore });
     if (!r.ok) return { ok: false, error: r.error };
+    fuzzyNote(`@${r.role.name}`, r.score);
     params[`${f}Id`] = r.role.id;
     params[`${f}Label`] = r.role.id === guild.id ? '@everyone' : `@${r.role.name}`;
     if (f === 'role' && ['role.assign', 'role.bulk_assign'].includes(step.action)) {
@@ -80,19 +94,21 @@ export async function resolveStep({ guild, step, request, db, config, pendingRef
   }
   for (const f of MEMBER_FIELDS) {
     if (!params[f]) continue;
-    const r = await resolveMember(guild, params[f]);
+    const r = await resolveMember(guild, params[f], { minScore });
     if (!r.ok) return { ok: false, error: r.error };
     const m = r.member;
+    fuzzyNote(m.displayName, r.score);
     params[`${f}Id`] = m.id;
     params[`${f}Label`] = `${m.displayName} (${m.user?.username ?? m.id})`;
     if (step.action.startsWith('mod.')) {
       if (m.id === request.userId) return { ok: false, error: 'You cannot moderate yourself.' };
-      if (m.id === guild.ownerId || m.id === config.ownerId) return { ok: false, error: `${m.displayName} is protected and cannot be moderated.` };
+      if (isServerSupreme(m.id, guild, config)) return { ok: false, error: `${m.displayName} is protected and cannot be moderated.` };
     }
   }
   if (params.target) {
-    const r = await resolveTarget(guild, params.target);
+    const r = await resolveTarget(guild, params.target, { minScore });
     if (!r.ok) return { ok: false, error: r.error };
+    fuzzyNote(r.kind === 'role' ? `@${r.target.name}` : r.target.displayName, r.score);
     params.targetId = r.target.id;
     params.targetKind = r.kind;
     const isEveryone = r.kind === 'role' && r.target.id === guild.id;

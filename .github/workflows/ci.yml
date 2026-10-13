@@ -1,0 +1,44 @@
+# Lint, test, and build the production container on every push / pull request.
+# Runs on GitHub's free runners; no secrets are needed or used.
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+        env:
+          SOUL_SOCIETY_NO_DOTENV: '1'
+
+  container:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: soul-society:ci
+      - name: Container smoke checks (no Discord connection)
+        run: |
+          docker run --rm -e SOUL_SOCIETY_NO_DOTENV=1 soul-society:ci node --disable-warning=ExperimentalWarning apps/register-commands.js --dry-run
+          docker run --rm -e KNIGHT_TOKEN= -e AEGIS_TOKEN= soul-society:ci node --disable-warning=ExperimentalWarning scripts/check-production.js || test $? -eq 1
+          docker run --rm soul-society:ci node -e "require('@napi-rs/canvas'); console.log('ffmpeg', require('ffmpeg-static'))"
+      - name: Persistent volume survives container re-creation
+        run: |
+          docker volume create ss-ci-data
+          docker run --rm -v ss-ci-data:/app/data soul-society:ci node -e "import('./database/db.js').then(m=>{const d=m.openDatabase('/app/data/soul-society.db');d.run(\"INSERT INTO kv (key,value,updated_at) VALUES ('ci','1',0)\");d.close();console.log('written')})"
+          docker run --rm -v ss-ci-data:/app/data soul-society:ci node -e "import('./database/db.js').then(m=>{const d=m.openDatabase('/app/data/soul-society.db');const r=d.get(\"SELECT value FROM kv WHERE key='ci'\");if(!r)process.exit(1);console.log('persisted:',r.value)})"

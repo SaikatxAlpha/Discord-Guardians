@@ -1,7 +1,7 @@
 // Runtime shared by KNIGHT and AEGIS: Discord client, ALPHA coordinator,
 // interaction routing, approval buttons, cross-bot task worker, scheduler,
 // heartbeats and graceful shutdown.
-import { Client, Events, MessageFlags } from 'discord.js';
+import { Client, Events, MessageFlags, PermissionFlagsBits } from 'discord.js';
 import { loadEnv, getConfig, validateConfig } from '../../config/env.js';
 import { THEME } from '../../config/defaults.js';
 import { createLogger } from '../../core/logger.js';
@@ -13,7 +13,7 @@ import { claimTask, completeTask, failTask, reapExpiredTasks, releaseWorkerLease
 import { expireApprovals, setApprovalMessage } from '../../core/approvals.js';
 import { Scheduler, createJob } from '../../core/scheduler.js';
 import { heartbeat, runBackup } from '../../core/health.js';
-import { getGuildSettings } from '../../core/settings.js';
+import { getGuildSettings, initGuildSettings, setGuildSetting } from '../../core/settings.js';
 import { renderResponse, approvalButtons } from './render.js';
 import { systemHandlers } from './systemHandlers.js';
 import { guardianEmbed, STATUS_COLORS } from '../../core/discord/theme.js';
@@ -30,7 +30,7 @@ export class GuardianBot {
     this.name = name;
     this.theme = THEME[name];
     this.config = getConfig();
-    this.logger = createLogger(name.toUpperCase(), { dir: this.config.logDir, level: this.config.logLevel });
+    this.logger = createLogger(name.toUpperCase(), { dir: this.config.logToFile ? this.config.logDir : null, level: this.config.logLevel });
     const { errors, warnings } = validateConfig(this.config, { bots: [name] });
     for (const w of warnings) this.logger.warn(w);
     if (errors.length) {
@@ -130,7 +130,21 @@ export class GuardianBot {
     await interaction.editReply({ ...payload, components: res.status === 'rejected' ? [approvalButtons(approvalId, true)] : payload.components });
   }
 
+  /** Per-user rate limit: at most 8 interactions per 10 seconds (all servers). */
+  rateLimited(userId, now = Date.now()) {
+    this.rate ??= new Map();
+    const hits = (this.rate.get(userId) ?? []).filter((t) => now - t < 10000);
+    hits.push(now);
+    this.rate.set(userId, hits);
+    if (this.rate.size > 5000) for (const [k, v] of this.rate) if (!v.length || now - v.at(-1) > 10000) this.rate.delete(k);
+    return hits.length > 8;
+  }
+
   async onInteraction(interaction) {
+    if (!interaction.isAutocomplete() && this.rateLimited(interaction.user.id)) {
+      if (interaction.isRepliable()) await interaction.reply({ content: 'Slow down a little — too many commands in a few seconds.', flags: MessageFlags.Ephemeral }).catch(() => null);
+      return;
+    }
     try {
       if (interaction.isChatInputCommand() || interaction.isAutocomplete()) {
         const cmd = this.commands.get(interaction.commandName);
@@ -151,6 +165,41 @@ export class GuardianBot {
         else await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => null);
       }
     }
+  }
+
+  // ------------------------------------------------------------ servers
+
+  /**
+   * First-run initialisation for a server: create its settings row with safe
+   * defaults and post this bot's setup guide once. Works for servers joined
+   * while the bot was offline too (called for every server on startup).
+   */
+  async initGuild(guild) {
+    const created = initGuildSettings(this.db, guild.id);
+    if (created) this.logger.info('new server initialised', { guildId: guild.id, members: guild.memberCount });
+    const s = getGuildSettings(this.db, guild.id);
+    const key = `meta.${this.name}IntroAt`;
+    if (s.meta[`${this.name}IntroAt`]) return;
+    // Servers configured before setup guides existed are marked, not messaged.
+    const firstSeen = Date.parse(s.meta.firstSeenAt ?? ''); // NaN for null / 'legacy'
+    if (!Number.isFinite(firstSeen) || Date.now() - firstSeen > 24 * 3600 * 1000) {
+      if (!s.meta.firstSeenAt) setGuildSetting(this.db, guild.id, 'meta.firstSeenAt', 'legacy');
+      setGuildSetting(this.db, guild.id, key, 'skipped (existing server)');
+      return;
+    }
+    const channel = this.introChannel(guild);
+    if (channel && this.introMessage) {
+      await channel.send({ embeds: [this.introMessage(guild)], allowedMentions: { parse: [] } }).catch((err) => this.logger.warn('could not post setup guide', { guildId: guild.id, err: err.message }));
+    }
+    setGuildSetting(this.db, guild.id, key, new Date().toISOString());
+  }
+
+  /** Where to post the setup guide: the system channel, else the first channel the bot can write to. */
+  introChannel(guild) {
+    const me = guild.members.me;
+    const can = (c) => c?.isTextBased?.() && !c.isThread?.() && c.permissionsFor?.(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks]);
+    if (can(guild.systemChannel)) return guild.systemChannel;
+    return [...guild.channels.cache.values()].filter(can).sort((a, b) => (a.rawPosition ?? 0) - (b.rawPosition ?? 0))[0] ?? null;
   }
 
   // ------------------------------------------------------------ cross-bot worker
@@ -231,6 +280,12 @@ export class GuardianBot {
 
   async start() {
     this.client.on(Events.InteractionCreate, (i) => this.onInteraction(i));
+    this.client.on(Events.GuildCreate, (g) => {
+      this.logger.info('joined server', { guildId: g.id, members: g.memberCount });
+      this.initGuild(g).catch((err) => this.logger.warn('server init failed', { guildId: g.id, err: err.message }));
+      this.onGuildJoin?.(g);
+    });
+    this.client.on(Events.GuildDelete, (g) => this.logger.info('removed from server', { guildId: g.id }));
     this.client.on(Events.Error, (err) => this.logger.error('discord client error', { err }));
     this.client.on(Events.ShardDisconnect, () => this.logger.warn('gateway disconnected'));
     this.client.on(Events.ShardResume, () => this.logger.info('gateway resumed'));
@@ -239,6 +294,8 @@ export class GuardianBot {
       c.user.setPresence({ activities: [{ name: this.theme.presence, type: 4, state: this.theme.presence }], status: 'online' });
       this.beat();
       this.startLoops();
+      this.logger.info('providers', { ai: this.ai.status().provider, stt: this.stt.status().provider, sttModel: this.stt.status().model ?? null, commandScope: this.config.commandScope, production: this.config.production });
+      for (const guild of c.guilds.cache.values()) await this.initGuild(guild).catch((err) => this.logger.warn('server init failed', { guildId: guild.id, err: err.message }));
       await this.onReady?.(c);
     });
     process.on('unhandledRejection', (err) => this.logger.error('unhandled rejection', { err }));

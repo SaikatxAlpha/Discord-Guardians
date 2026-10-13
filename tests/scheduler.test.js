@@ -5,6 +5,7 @@ import { enqueueTask, claimTask, completeTask, failTask, reapExpiredTasks, relea
 import { openDatabase } from '../database/db.js';
 import { memoryLogger } from '../core/logger.js';
 import { fileDb, memDb } from './helpers.js';
+import { MIGRATIONS } from '../database/migrations.js';
 
 const TZ = 'Asia/Kolkata';
 
@@ -136,7 +137,7 @@ test('task queue: atomic claim across connections, idempotency keys, lease recov
 test('migrations are idempotent across processes and backups are consistent copies', async () => {
   const { db, file, dir } = fileDb();
   const again = openDatabase(file);
-  assert.equal(again.get('SELECT COUNT(*) AS n FROM schema_migrations').n, 1);
+  assert.equal(again.get('SELECT COUNT(*) AS n FROM schema_migrations').n, MIGRATIONS.length);
   db.run(`INSERT INTO kv (key, value, updated_at) VALUES ('x', '1', 0)`);
   const { runBackup } = await import('../core/health.js');
   const out = runBackup(db, `${dir}/backups`, 2);

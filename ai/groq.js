@@ -47,12 +47,24 @@ export async function groqChatJson({ apiKey, model, system, user, timeoutMs = 15
   return JSON.parse(content);
 }
 
-export async function groqTranscribe({ apiKey, model, wav, language, timeoutMs = 20000, fetchImpl }) {
+/**
+ * Parameters per https://console.groq.com/docs/speech-to-text :
+ * file, model, language (ISO-639-1), prompt (≤224 tokens), response_format,
+ * temperature (0 recommended).
+ */
+export async function groqTranscribe({ apiKey, model, wav, language, prompt, timeoutMs = 20000, fetchImpl }) {
   const form = new FormData();
   form.append('file', new Blob([wav], { type: 'audio/wav' }), 'utterance.wav');
   form.append('model', model);
   form.append('response_format', 'verbose_json');
   form.append('temperature', '0');
   if (language) form.append('language', language);
+  if (prompt) form.append('prompt', prompt);
   return request('/audio/transcriptions', { apiKey, timeoutMs, fetchImpl, body: form, json: false });
+}
+
+/** Network failures, timeouts and 5xx are worth one more try; 4xx are not. */
+export function isRetryable(err) {
+  if (err?.status) return err.status >= 500;
+  return ['TimeoutError', 'AbortError', 'TypeError'].includes(err?.name) || /fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN/i.test(String(err?.message));
 }

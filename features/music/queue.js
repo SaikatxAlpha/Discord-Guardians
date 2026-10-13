@@ -18,8 +18,9 @@ export class Mutex {
 }
 
 export class MusicQueue {
-  constructor(tracks = []) {
-    this.tracks = tracks.slice(0, MAX_QUEUE);
+  constructor(tracks = [], { max = MAX_QUEUE } = {}) {
+    this.max = max;
+    this.tracks = tracks.slice(0, max);
     this.current = null;
   }
 
@@ -28,9 +29,17 @@ export class MusicQueue {
   }
 
   add(track) {
-    if (this.tracks.length >= MAX_QUEUE) throw new Error(`The queue is full (${MAX_QUEUE} tracks).`);
+    if (this.tracks.length >= this.max) throw new Error(`The queue is full (${this.max} tracks).`);
     this.tracks.push(track);
     return this.tracks.length;
+  }
+
+  /** Add as many as fit; returns how many were added. */
+  addMany(tracks) {
+    const room = Math.max(0, this.max - this.tracks.length);
+    const add = tracks.slice(0, room);
+    this.tracks.push(...add);
+    return add.length;
   }
 
   /** Advance: the next track becomes current (or null). */
@@ -52,6 +61,15 @@ export class MusicQueue {
     const [t] = this.tracks.splice(from - 1, 1);
     this.tracks.splice(to - 1, 0, t);
     return t;
+  }
+
+  /** Fisher–Yates shuffle of the upcoming tracks. */
+  shuffle(rng = Math.random) {
+    for (let i = this.tracks.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      [this.tracks[i], this.tracks[j]] = [this.tracks[j], this.tracks[i]];
+    }
+    return this.tracks.length;
   }
 
   clear() {

@@ -5,7 +5,8 @@ import prism from 'prism-media';
 import { pathToFileURL } from 'node:url';
 import { GuardianBot } from '../shared/botBase.js';
 import { spokenSummary } from '../shared/render.js';
-import { aegisHandlers, aegisJobs, takePick, enqueueTrack } from './handlers.js';
+import { aegisHandlers, aegisJobs } from './handlers.js';
+import { takePick, enqueueTrack } from './music.js';
 import { aegisCommands, onEventJoinButton } from './commands.js';
 import { syncReportJobs } from './reports.js';
 import { VoiceHub } from '../../features/voice/hub.js';
@@ -13,12 +14,12 @@ import { VoicePipeline } from '../../features/voice/pipeline.js';
 import { AlphaListener } from '../../features/voice/listener.js';
 import { synthesize, ttsAvailable } from '../../features/voice/tts.js';
 import { MusicManager } from '../../features/music/manager.js';
-import { createMusicAdapter } from '../../features/music/discordAdapter.js';
+import { createMusicAdapter, killAllStreams } from '../../features/music/discordAdapter.js';
 import { describeTrack } from '../../features/music/providers.js';
 import { onMemberJoin, onMemberLeave } from '../../features/welcome/handler.js';
 import { recordMessageActivity } from '../../features/intelligence/analytics.js';
 import { rewardMessage, rewardVoiceMinute, isVoiceEligible, seedShop } from '../../features/progression/economy.js';
-import { WAKE_WORD_RE } from '../../core/intents/parser.js';
+import { buildWakeMatcher } from '../../features/voice/wakeword.js';
 import { canUseAlpha } from '../../core/auth.js';
 import { getGuildSettings } from '../../core/settings.js';
 import { checkRoleManageable } from '../../core/discord/safety.js';
@@ -38,7 +39,15 @@ export function createAegis() {
   const app = new GuardianBot({ name: 'aegis', intents: AEGIS_INTENTS, partials: [Partials.GuildMember] });
   const { db, config, logger, client } = app;
   const hub = new VoiceHub({ bot: 'aegis', logger });
-  const music = new MusicManager({ db, logger, idleLeaveMs: config.music.idleLeaveMs, adapterFor: (guild) => createMusicAdapter({ guild, hub }) });
+  const textWake = buildWakeMatcher(config.voice.wakeWord);
+  const music = new MusicManager({
+    db,
+    logger,
+    idleLeaveMs: config.music.idleLeaveMs,
+    maxQueue: config.music.maxQueue,
+    defaultVolume: config.music.defaultVolume,
+    adapterFor: (guild) => createMusicAdapter({ guild, hub, maxStreams: config.music.maxStreams }),
+  });
 
   // ---------------------------------------------------------------- spoken responses
   async function speak(guild, text) {
@@ -66,37 +75,68 @@ export function createAegis() {
   }
 
   // ---------------------------------------------------------------- ALPHA voice
-  let lastSttWarning = 0;
+  // Speaker policy is evaluated per server: its owner plus the users/roles it trusts.
+  const allowSpeaker = (guild, userId) =>
+    canUseAlpha(userId, config, { guild, settings: getGuildSettings(db, guild.id), member: guild.members.cache.get(userId) ?? null });
+  const sttWarnedAt = new Map(); // guildId -> ts (throttle notices per server)
+  const STT_ERRORS = {
+    limit_guild: "This server's daily voice-command limit was reached. Use `/alpha` or type \"ALPHA, ...\" until tomorrow.",
+    limit_global: 'The daily speech-to-text allowance is used up. Use `/alpha` or type "ALPHA, ..." until tomorrow.',
+    rate_limited: 'Speech-to-text is rate limited right now; voice commands will resume shortly.',
+    unavailable: 'Speech-to-text is not configured on this deployment.',
+    failed: 'Speech-to-text did not respond. Please try again.',
+  };
   const pipeline = new VoicePipeline({
     stt: app.stt,
     config,
+    authorize: (u) => {
+      const guild = client.guilds.cache.get(u.guildId);
+      return Boolean(guild) && allowSpeaker(guild, u.userId);
+    },
+    guildOptions: (guildId) => {
+      const s = getGuildSettings(db, guildId);
+      return { language: s.voice.language ?? undefined, vocabulary: s.voice.vocabulary, guildLimit: s.voice.dailyLimit ?? config.stt.guildDailyLimit };
+    },
     handleCommand: (req) => app.coordinator.handleText(req),
     onEvent: async (ev) => {
       const guild = client.guilds.cache.get(ev.guildId);
       const session = listener.sessions.get(ev.guildId);
       if (!guild || !session) return;
+      const s = getGuildSettings(db, guild.id);
       if (ev.type === 'heard') {
-        await sendToChannel(guild, session.textChannelId, { content: `🎙️ <@${ev.userId}>: “${safeText(ev.command, 300)}”` }, logger);
+        if (s.voice.echoTranscripts) {
+          const note = ev.forceConfirm ? ' — not fully sure, so I will ask before changing anything' : '';
+          await sendToChannel(guild, session.textChannelId, { content: `🎙️ <@${ev.userId}>: “${safeText(ev.command, 300)}” (${Math.round(ev.confidence * 100)}%${note})` }, logger);
+        }
+      } else if (ev.type === 'repeat') {
+        await sendToChannel(guild, session.textChannelId, { content: `🎙️ <@${ev.userId}>, I didn't catch that clearly — please repeat. Nothing was done.` }, logger);
       } else if (ev.type === 'result') {
         await app.postResponse(guild, session.textChannelId, ev.result);
         await speak(guild, spokenSummary(ev.result));
-      } else if (ev.type === 'stt_error' && Date.now() - lastSttWarning > 60000) {
-        lastSttWarning = Date.now();
-        await sendToChannel(guild, session.textChannelId, { embeds: [guardianEmbed('aegis', { title: 'Speech-to-text unavailable', color: STATUS_COLORS.warn, description: `${safeText(ev.error, 300)}\nUse \`/alpha\` or type "ALPHA, ..." meanwhile.` })] }, logger);
+      } else if (ev.type === 'stt_error' && Date.now() - (sttWarnedAt.get(guild.id) ?? 0) > 60000) {
+        sttWarnedAt.set(guild.id, Date.now());
+        logger.warn('voice transcription unavailable', { guildId: guild.id, code: ev.code });
+        await sendToChannel(guild, session.textChannelId, { embeds: [guardianEmbed('aegis', { title: 'Voice commands paused', color: STATUS_COLORS.warn, description: STT_ERRORS[ev.code] ?? STT_ERRORS.failed })] }, logger);
       }
     },
   });
+  const updatePresence = () => {
+    const n = listener.sessions.size;
+    client.user?.setPresence({ activities: [{ name: 'status', type: 4, state: n ? `🎙️ Listening for ${config.voice.wakeWord} in ${n} server${n > 1 ? 's' : ''}` : app.theme.presence }], status: 'online' });
+  };
   const listener = new AlphaListener({
     hub,
     pipeline,
     config,
     logger,
+    allowSpeaker,
     onChange: (guildId, on) => {
-      client.user?.setPresence({ activities: [{ name: 'status', type: 4, state: on ? '🎙️ Listening for ALPHA' : app.theme.presence }], status: on ? 'dnd' : 'online' });
+      updatePresence();
+      logger.info(on ? 'voice listening started' : 'voice listening stopped', { guildId });
       if (!on) {
         const guild = client.guilds.cache.get(guildId);
         const s = guild && getGuildSettings(db, guildId);
-        if (guild && s.channels.alpha) sendToChannel(guild, s.channels.alpha, { content: '🔇 ALPHA stopped listening. Audio capture is off.' }, logger);
+        if (guild && s.channels.alpha) sendToChannel(guild, s.channels.alpha, { content: `🔇 ${config.voice.wakeWord} stopped listening. Audio capture is off.` }, logger);
       }
     },
   });
@@ -112,27 +152,22 @@ export function createAegis() {
     const track = p.results[Number(i.values[0])];
     await i.deferUpdate();
     const guild = await app.getGuild(p.guildId);
-    const r = await enqueueTrack({ music, guild }, track, p.voiceChannelId, p.textChannelId).catch((err) => ({ ok: false, message: err.message }));
+    const r = await enqueueTrack({ music, guild, request: { userId: i.user.id } }, track, p.voiceChannelId, p.textChannelId).catch((err) => ({ ok: false, message: err.message }));
     await i.editReply({ content: r.message, components: [], embeds: [] });
   });
 
-  // ---------------------------------------------------------------- music notifications
-  const announced = new WeakSet();
-  const wireMusic = (gm) => {
-    if (announced.has(gm)) return;
-    announced.add(gm);
-    const post = (content) => client.guilds.fetch(gm.guildId).then((g) => sendToChannel(g, gm.textChannelId, { content }, logger)).catch(() => null);
-    gm.on('trackError', (track, err) => post(`⚠️ Could not play **${safeText(track?.title ?? 'track', 100)}** (${safeText(err.message, 150)}). Skipping.`));
-    gm.on('halted', () => post('⛔ Several tracks failed in a row; playback stopped.'));
-    gm.on('disconnected', () => post('🔌 Lost the voice connection. The queue was saved — use /play to continue.'));
+  // ---------------------------------------------------------------- music notifications (wired once per server)
+  music.onCreate((gm) => {
+    const post = (content, always = false) =>
+      client.guilds
+        .fetch(gm.guildId)
+        .then((g) => (always || getGuildSettings(db, g.id).music.announceTracks ? sendToChannel(g, gm.textChannelId, { content }, logger) : null))
+        .catch(() => null);
+    gm.on('trackError', (track, err) => post(`⚠️ Could not play **${safeText(track?.title ?? 'track', 100)}** (${safeText(err.message, 150)}). Skipping.`, true));
+    gm.on('halted', () => post('⛔ Several tracks failed in a row; playback stopped.', true));
+    gm.on('disconnected', () => post('🔌 Lost the voice connection. The queue was saved — use /play to continue.', true));
     gm.on('trackStart', (t) => post(`🎶 Now playing **${safeText(describeTrack(t), 150)}**`));
-  };
-  const origGet = music.get.bind(music);
-  music.get = (guild) => {
-    const gm = origGet(guild);
-    wireMusic(gm);
-    return gm;
-  };
+  });
 
   // ---------------------------------------------------------------- level rewards
   async function onLevelUp(guild, member, level, channel) {
@@ -153,10 +188,11 @@ export function createAegis() {
     try {
       recordMessageActivity(db, { guildId: message.guild.id, channelId: message.channelId, userId: message.author.id, tz: config.timezone });
       const s = getGuildSettings(db, message.guild.id);
-      // Typed ALPHA commands (owner only; ignored silently for others).
-      if (s.alpha.textPrefixEnabled && WAKE_WORD_RE.test(message.content) && canUseAlpha(message.author.id, config) && (!s.channels.alpha || s.channels.alpha === message.channelId)) {
+      // Typed ALPHA commands (server owner / trusted only; ignored silently for others).
+      const typed = s.alpha.textPrefixEnabled ? textWake.detect(message.content.slice(0, 600)) : { activated: false };
+      if (typed.activated && allowSpeaker(message.guild, message.author.id) && (!s.channels.alpha || s.channels.alpha === message.channelId)) {
         await message.channel.sendTyping().catch(() => null);
-        const res = await app.coordinator.handleText({ requestId: `msg:${message.id}`, guildId: message.guild.id, channelId: message.channelId, userId: message.author.id, source: 'text', text: message.content });
+        const res = await app.coordinator.handleText({ requestId: `msg:${message.id}`, guildId: message.guild.id, channelId: message.channelId, userId: message.author.id, member: message.member, source: 'text', text: typed.command || 'help' });
         await app.postResponse(message.guild, message.channelId, res);
         return;
       }
@@ -171,10 +207,11 @@ export function createAegis() {
   client.on(Events.VoiceStateUpdate, (oldS, newS) => {
     const session = listener.sessions.get(oldS.guild.id);
     if (!session) return;
-    // Stop listening when the owner leaves the channel ALPHA is in.
-    if (oldS.id === config.ownerId && oldS.channelId === session.channelId && newS.channelId !== session.channelId) {
-      listener.stop(oldS.guild.id, { musicActive: Boolean(music.peek(oldS.guild.id)?.queue.current) });
-    }
+    // Stop listening once nobody allowed to use ALPHA remains in that channel.
+    if (oldS.channelId !== session.channelId || newS.channelId === session.channelId) return;
+    const channel = oldS.guild.channels.cache.get(session.channelId);
+    const stillAllowed = channel?.members?.some((m) => !m.user.bot && allowSpeaker(oldS.guild, m.id));
+    if (!stillAllowed) listener.stop(oldS.guild.id, { musicActive: Boolean(music.peek(oldS.guild.id)?.queue.current) });
   });
 
   // Voice activity rewards (idempotent per user-minute; idle farming filtered).
@@ -202,15 +239,32 @@ export function createAegis() {
       syncReportJobs(app, guild.id);
     }
   };
+  app.onGuildJoin = (guild) => seedShop(db, guild.id);
+  app.introMessage = () =>
+    guardianEmbed('aegis', {
+      title: 'AEGIS has arrived',
+      description: [
+        'I run music, the `' + config.voice.wakeWord + '` assistant, welcome cards, research, reports, events and the aura economy.',
+        '',
+        '**Next steps (admins):**',
+        '1. `/setup channel` — pick welcome, alpha, music, reports and research channels.',
+        '2. `/setup trusted` — besides the server owner, who may give `' + config.voice.wakeWord + '` commands.',
+        '3. `/setup welcome` — message, tagline and an optional custom background.',
+        '4. `/settings view` — review everything; `/voice diagnostics` — check voice.',
+        '',
+        'Music: `/play` searches licensed sources (Audius, Jamendo, Internet Archive).',
+      ].join('\n'),
+    });
   app.onShutdown = async () => {
     listener.stopAll();
     music.shutdown();
+    killAllStreams();
     hub.destroyAll();
   };
   return app;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   createAegis()
     .start()
     .catch((err) => {

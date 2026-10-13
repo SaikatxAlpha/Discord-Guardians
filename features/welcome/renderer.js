@@ -4,8 +4,8 @@
 // (or WELCOME_BACKGROUND) and drawn cover-fitted without repainting it. Only
 // the dynamic layers are drawn on top: spirit particles, the glowing avatar
 // frame, the member's real avatar and display name, and the tagline. If the
-// original file is missing, a clearly-labelled procedural stand-in in the
-// same palette is used so the bot keeps working.
+// original file is missing, the built-in procedural design in the same
+// palette is used. Servers can upload their own background (/setup welcome).
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -37,6 +37,9 @@ export function registerFonts() {
     ['Cinzel-Bold.ttf', 'Cinzel'],
     ['Rajdhani-Bold.ttf', 'Rajdhani'],
     ['Rajdhani-SemiBold.ttf', 'Rajdhani'],
+    // Bundled so names like "𓆩 𝐕𝐎𝐈𝐃𝐖𝐎𝐑𝐊𝐒 𓆪" render on Linux hosts too.
+    ['NotoSansEgyptianHieroglyphs-Regular.ttf', 'Noto Sans Egyptian Hieroglyphs'],
+    ['NotoSansMath-Regular.ttf', 'Noto Sans Math'],
   ];
   for (const [file, family] of fonts) {
     const p = path.join(dir, file);
@@ -45,9 +48,9 @@ export function registerFonts() {
 }
 
 // Fallback chain covers CJK, symbols, hieroglyphs (𓆩 𓆪) and emoji on Windows.
-const NAME_FONT = (px) => `bold ${px}px Rajdhani, "Segoe UI", "Segoe UI Symbol", "Segoe UI Historic", "Yu Gothic UI", "Microsoft YaHei UI", "Malgun Gothic", "Nirmala UI", "Segoe UI Emoji", sans-serif`;
-const TITLE_FONT = (px) => `900 ${px}px Cinzel, "Segoe UI", serif`;
-const SMALL_FONT = (px) => `600 ${px}px "Segoe UI Historic", "Segoe UI Symbol", "Cambria Math", "Segoe UI", sans-serif`;
+const NAME_FONT = (px) => `bold ${px}px Rajdhani, "Segoe UI", "Segoe UI Symbol", "Segoe UI Historic", "Noto Sans Math", "Noto Sans Egyptian Hieroglyphs", "Yu Gothic UI", "Microsoft YaHei UI", "Malgun Gothic", "Nirmala UI", "Noto Sans CJK SC", "Segoe UI Emoji", "Noto Color Emoji", "DejaVu Sans", sans-serif`;
+const TITLE_FONT = (px) => `900 ${px}px Cinzel, "Segoe UI", "DejaVu Serif", serif`;
+const SMALL_FONT = (px) => `600 ${px}px "Segoe UI Historic", "Segoe UI Symbol", "Cambria Math", "Noto Sans Math", "Noto Sans Egyptian Hieroglyphs", "Segoe UI", "Noto Color Emoji", "DejaVu Sans", sans-serif`;
 
 export function findBackground(explicit) {
   const candidates = [explicit, ...['png', 'jpg', 'jpeg', 'webp'].map((e) => path.join(ROOT, 'assets', 'welcome', `background.${e}`))].filter(Boolean);
@@ -159,7 +162,6 @@ export function drawFallbackBackground(ctx, w, h) {
   ctx.font = SMALL_FONT(Math.round(h * 0.028));
   ctx.fillStyle = 'rgba(255,255,255,0.55)';
   ctx.textAlign = 'right';
-  ctx.fillText('stand-in background — add assets/welcome/background.png', w - 14, h - 12);
   ctx.restore();
 }
 
@@ -299,7 +301,7 @@ function spacedText(ctx, text, x, y, spacing) {
   return total;
 }
 
-function drawTexts(ctx, w, h, layout, name, scale) {
+function drawTexts(ctx, w, h, layout, name, scale, { tagline = TAGLINE, serverName = SERVER_NAME } = {}) {
   ctx.save();
   ctx.textBaseline = 'middle';
   // Display name: shrink to fit.
@@ -326,7 +328,13 @@ function drawTexts(ctx, w, h, layout, name, scale) {
   ctx.fillStyle = tg;
   ctx.shadowColor = VIOLET;
   ctx.shadowBlur = 16 * scale;
-  const tw = spacedText(ctx, TAGLINE, w / 2, ty, 6 * scale);
+  // Long taglines shrink to fit.
+  let tpx = Math.round(30 * scale);
+  while (tpx > 14 * scale && ctx.measureText(tagline).width + tagline.length * 6 * scale > w * 0.7) {
+    tpx -= 2;
+    ctx.font = TITLE_FONT(tpx);
+  }
+  const tw = spacedText(ctx, tagline, w / 2, ty, 6 * scale);
   ctx.shadowBlur = 10 * scale;
   // Neon rules either side of the tagline.
   for (const dir of [-1, 1]) {
@@ -349,7 +357,7 @@ function drawTexts(ctx, w, h, layout, name, scale) {
     ctx.font = SMALL_FONT(Math.round(22 * scale));
     ctx.fillStyle = 'rgba(237,233,254,0.92)';
     ctx.textAlign = 'center';
-    ctx.fillText(SERVER_NAME, w / 2, 34 * scale);
+    ctx.fillText(serverName, w / 2, 34 * scale);
   }
   ctx.restore();
 }
@@ -358,7 +366,7 @@ function drawTexts(ctx, w, h, layout, name, scale) {
  * Prepare reusable layers (background and foreground) for one member.
  * @param {{background?:string|null, avatar?:Buffer|null, displayName:string, width?:number}} opts
  */
-export async function prepareCard({ background = findBackground(), avatar = null, displayName, width = CARD_W } = {}) {
+export async function prepareCard({ background = findBackground(), avatar = null, displayName, width = CARD_W, tagline = TAGLINE, serverName = SERVER_NAME } = {}) {
   registerFonts();
   const w = width;
   const h = Math.round((width * CARD_H) / CARD_W);
@@ -393,7 +401,7 @@ export async function prepareCard({ background = findBackground(), avatar = null
   const fg = createCanvas(w, h);
   const fctx = fg.getContext('2d');
   drawAvatar(fctx, cx, cy, R, avatarImg, name);
-  drawTexts(fctx, w, h, layout, name, scale);
+  drawTexts(fctx, w, h, layout, name, scale, { tagline: sanitizeDisplayName(tagline, 40).toUpperCase(), serverName: sanitizeDisplayName(serverName, 48) });
 
   return { w, h, scale, base, fg, cx, cy, R, name, usedOriginal, avatarUsed: Boolean(avatarImg), particles: makeParticles(name.length * 97 + 13, Math.round(70 * scale + 20)) };
 }

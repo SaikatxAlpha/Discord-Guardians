@@ -2,10 +2,18 @@
 
 ## Identity
 
-- **ALPHA natural-language and voice control is limited to `OWNER_ID`, plus anyone listed in `TRUSTED_USER_IDS`.**
+- **Authority is decided per server.** In each server, ALPHA natural-language and voice control is limited to that **server's owner**, plus the users and roles that server trusts (`/setup trusted`).
+- The bot operator (`OWNER_ID`) has **no** special power in other people's servers unless `OPERATOR_GLOBAL_ACCESS=true` is set deliberately. The same applies to `TRUSTED_USER_IDS`.
 - Identity is the Discord user ID that Discord attaches to the interaction, message or voice stream.
-- "ALPHA" is only an activation phrase, not authentication. In voice, AEGIS subscribes only to the owner's or trusted users' audio streams, so other members are never transcribed.
+- "ALPHA" (or your `WAKE_WORD`) is only an activation phrase, not authentication. In voice, AEGIS captures only the streams of users allowed to use ALPHA in that server, so other members are never transcribed. One person's voice cannot act on behalf of another.
 - Slash commands use Discord permissions mapped to authority levels: Member, Moderator (Timeout/Kick/Ban), Admin (Manage Server/Administrator), Trusted, Owner. Each action in [core/actions/registry.js](../core/actions/registry.js) declares the minimum level.
+- Every user is limited to 8 commands per 10 seconds. Speech-to-text has deployment-wide and per-server daily caps. Music has a global cap on concurrent streams.
+
+## Multi-server isolation
+
+Settings, music queues, voice sessions, moderation cases, economy and usage counters are all keyed by server ID. No server ID, channel ID, role ID or user ID is hard-coded in production code (a test enforces this).
+
+When a bot joins a server, it creates that server's settings with safe defaults: moderation in simulation mode, voice moderation off. It posts its setup guide once.
 
 ## What ALPHA can do
 
@@ -56,6 +64,19 @@ Every attempt is recorded as a case (`mod_cases`) with its rule, points, evidenc
 - **Automod defaults to simulation.**
 - **Quoted text and code blocks** are flagged for review, not punished.
 - **Voice moderation** is off by default. Uncertain transcripts go to `/reviews`, and automatic action is capped at warn (or timeout if configured). It never kicks or bans from speech recognition.
+
+## Uncertain input never triggers destructive actions
+
+- **Low-confidence voice transcripts:**
+  - very low: AEGIS asks you to repeat and does nothing
+  - uncertain: any state-changing action needs a button confirmation
+- **Typo-tolerant name matching** is never used to choose the target of high-risk actions (ban, kick, deletions, lockdown), which need an exact name, mention or ID. Voice commands never use it at all; partial-name matches add a warning and require confirmation from voice.
+- **Ambiguous names** ("gaming" matching two channels) are refused with a list of candidates.
+
+## Network and uploads
+
+- Admin-supplied music links must be https. They are refused if their hostname resolves to a private or loopback address (SSRF protection), and they can't contain credentials.
+- Welcome backgrounds must be PNG/JPG/WebP, at most 8 MB, decodable and at least 400×160, downloaded only from Discord's CDN. They are stored as `<guildId>.<ext>` under `DATA_DIR/backgrounds`.
 
 ## Channels, roles and permissions
 

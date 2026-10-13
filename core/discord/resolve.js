@@ -66,9 +66,19 @@ const idFrom = (ref, re) => {
   return m ? m[1] : null;
 };
 
+/**
+ * Apply a minimum match quality. Exact name = 100, prefix/suffix ≈ 60–80,
+ * substring ≈ 40–60, typo-tolerant ≤ 50. Weak matches are reported as a
+ * suggestion instead of being used.
+ */
+function enforceMinScore(r, minScore, label, describe) {
+  if (!r.match || (r.score ?? 100) >= minScore) return r;
+  return { match: null, weak: true, error: `I'm not certain which ${label} you mean. Did you mean ${describe(r.match)}? Please use its exact name or mention it.` };
+}
+
 const CHANNEL_TYPE_NAMES = { 0: 'text', 2: 'voice', 4: 'category', 5: 'announcement', 13: 'stage', 15: 'forum' };
 
-export async function resolveChannel(guild, ref, { types } = {}) {
+export async function resolveChannel(guild, ref, { types, minScore = 0 } = {}) {
   if (!ref) return { ok: false, error: 'No channel specified.' };
   const id = idFrom(ref, /^(?:<#)?(\d{17,20})>?$/);
   if (id) {
@@ -77,13 +87,14 @@ export async function resolveChannel(guild, ref, { types } = {}) {
   }
   let pool = [...guild.channels.cache.values()];
   if (types) pool = pool.filter((c) => types.includes(CHANNEL_TYPE_NAMES[c.type]));
-  const r = fuzzyFind(pool, ref, (c) => [c.name]);
-  if (r.match) return { ok: true, channel: r.match };
+  const r = enforceMinScore(fuzzyFind(pool, ref, (c) => [c.name]), minScore, 'channel', (c) => `#${c.name}`);
+  if (r.weak) return { ok: false, error: r.error };
+  if (r.match) return { ok: true, channel: r.match, score: r.score };
   if (r.ambiguous) return { ok: false, error: `"${ref}" matches several channels: ${r.candidates.map((c) => `#${c.name}`).join(', ')}. Please be specific.` };
   return { ok: false, error: `No channel named "${ref}" was found.` };
 }
 
-export async function resolveRole(guild, ref) {
+export async function resolveRole(guild, ref, { minScore = 0 } = {}) {
   if (!ref) return { ok: false, error: 'No role specified.' };
   if (ref === '@everyone' || /^everyone$/i.test(ref)) return { ok: true, role: guild.roles.everyone };
   const id = idFrom(ref, /^(?:<@&)?(\d{17,20})>?$/);
@@ -92,13 +103,14 @@ export async function resolveRole(guild, ref) {
     return role ? { ok: true, role } : { ok: false, error: `Role ${ref} was not found.` };
   }
   const pool = [...guild.roles.cache.values()].filter((r) => r.id !== guild.id);
-  const r = fuzzyFind(pool, ref, (x) => [x.name]);
-  if (r.match) return { ok: true, role: r.match };
+  const r = enforceMinScore(fuzzyFind(pool, ref, (x) => [x.name]), minScore, 'role', (x) => `@${x.name}`);
+  if (r.weak) return { ok: false, error: r.error };
+  if (r.match) return { ok: true, role: r.match, score: r.score };
   if (r.ambiguous) return { ok: false, error: `"${ref}" matches several roles: ${r.candidates.map((x) => `@${x.name}`).join(', ')}. Please be specific.` };
   return { ok: false, error: `No role named "${ref}" was found.` };
 }
 
-export async function resolveMember(guild, ref) {
+export async function resolveMember(guild, ref, { minScore = 0 } = {}) {
   if (!ref) return { ok: false, error: 'No member specified.' };
   const id = idFrom(ref, /^(?:<@!?)?(\d{17,20})>?$/);
   if (id) {
@@ -112,17 +124,21 @@ export async function resolveMember(guild, ref) {
     const fetched = await guild.members.fetch({ query: String(ref).slice(0, 32), limit: 10 }).catch(() => null);
     if (fetched?.size) r = fuzzyFind(fetched.values(), ref, names);
   }
-  if (r.match) return { ok: true, member: r.match };
+  r = enforceMinScore(r, minScore, 'member', (m) => m.displayName);
+  if (r.weak) return { ok: false, error: r.error };
+  if (r.match) return { ok: true, member: r.match, score: r.score };
   if (r.ambiguous) return { ok: false, error: `"${ref}" matches several members: ${r.candidates.map((m) => m.displayName).join(', ')}. Use a mention or ID.` };
   return { ok: false, error: `No member named "${ref}" was found.` };
 }
 
 /** Channel permission target: a role first, then a member. */
-export async function resolveTarget(guild, ref) {
-  const role = await resolveRole(guild, ref);
-  if (role.ok) return { ok: true, kind: 'role', target: role.role };
-  const member = await resolveMember(guild, ref);
-  if (member.ok) return { ok: true, kind: 'member', target: member.member };
+export async function resolveTarget(guild, ref, opts = {}) {
+  const role = await resolveRole(guild, ref, opts);
+  if (role.ok) return { ok: true, kind: 'role', target: role.role, score: role.score };
+  const member = await resolveMember(guild, ref, opts);
+  if (member.ok) return { ok: true, kind: 'member', target: member.member, score: member.score };
+  if (role.error?.startsWith("I'm not certain")) return { ok: false, error: role.error };
+  if (member.error?.startsWith("I'm not certain")) return { ok: false, error: member.error };
   return { ok: false, error: `No role or member named "${ref}" was found.` };
 }
 

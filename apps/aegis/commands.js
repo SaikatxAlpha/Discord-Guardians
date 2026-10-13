@@ -12,18 +12,25 @@ import {
 } from '../../features/progression/economy.js';
 import { renderRankCard } from '../../features/progression/rankCard.js';
 import { fetchAvatar } from '../../features/welcome/renderer.js';
-import { buildWelcomeCard } from '../../features/welcome/handler.js';
+import { buildWelcomeCard, saveGuildBackground, removeGuildBackground, displayNameOf } from '../../features/welcome/handler.js';
 import { joinEvent } from '../../features/events/events.js';
 import { checkRoleManageable } from '../../core/discord/safety.js';
 import { syncReportJobs } from './reports.js';
+import { configCommands } from './configCommands.js';
 
 const P = PermissionFlagsBits;
 const eph = { flags: MessageFlags.Ephemeral };
 const ch = (c) => (c ? `<#${c.id}>` : undefined);
 
 function isAdmin(i, app) {
-  return authLevel({ userId: i.user.id, config: app.config, member: i.member }) >= AUTH.ADMIN;
+  return authLevel({ userId: i.user.id, config: app.config, member: i.member, guild: i.guild, settings: getGuildSettings(app.db, i.guildId) }) >= AUTH.ADMIN;
 }
+
+/** ALPHA access in THIS server: its owner and the users/roles it trusts. */
+function alphaAllowed(i, app) {
+  return canUseAlpha(i.user.id, app.config, { member: i.member, guild: i.guild, settings: getGuildSettings(app.db, i.guildId) });
+}
+const ALPHA_DENIED = "ALPHA only accepts instructions from this server's owner or the users/roles trusted with /setup trusted.";
 
 function whenFrom(text, app) {
   return parseWhen(text.startsWith('in ') || text.startsWith('at ') || /^(tomorrow|tonight|every|daily|on |next )/i.test(text) ? text : `at ${text}`, Date.now(), app.config.timezone);
@@ -37,26 +44,26 @@ export function aegisCommands({ listener, music }) {
   return [
     // ---------------------------------------------------------------- ALPHA
     {
-      data: new SlashCommandBuilder().setName('alpha').setDescription('Give ALPHA a natural-language instruction (owner only)')
+      data: new SlashCommandBuilder().setName('alpha').setDescription('Give ALPHA a natural-language instruction (server owner / trusted)')
         .addStringOption((o) => o.setName('command').setDescription('e.g. create a gaming channel and give the Gaming role access to it').setRequired(true).setMaxLength(500)),
       async execute(i, app) {
-        if (!canUseAlpha(i.user.id, app.config)) return i.reply({ content: 'ALPHA only accepts instructions from the Soul Society owner.', ...eph });
+        if (!alphaAllowed(i, app)) return i.reply({ content: ALPHA_DENIED, ...eph });
         await i.deferReply();
-        const res = await app.coordinator.handleText({ requestId: `ix:${i.id}`, guildId: i.guildId, channelId: i.channelId, userId: i.user.id, source: 'text', text: i.options.getString('command') });
+        const res = await app.coordinator.handleText({ requestId: `ix:${i.id}`, guildId: i.guildId, channelId: i.channelId, userId: i.user.id, member: i.member, source: 'text', text: i.options.getString('command') });
         return app.replyWithResponse(i, res);
       },
     },
     {
-      data: new SlashCommandBuilder().setName('listen').setDescription('ALPHA voice listening (owner only)')
+      data: new SlashCommandBuilder().setName('listen').setDescription('ALPHA voice listening (server owner / trusted)')
         .addSubcommand((s) => s.setName('start').setDescription('Join your voice channel and listen for "ALPHA"'))
         .addSubcommand((s) => s.setName('stop').setDescription('Stop listening'))
         .addSubcommand((s) => s.setName('status').setDescription('Is ALPHA listening?')),
       async execute(i, app) {
-        if (!canUseAlpha(i.user.id, app.config)) return i.reply({ content: 'Only the owner can control ALPHA listening.', ...eph });
+        if (!alphaAllowed(i, app)) return i.reply({ content: ALPHA_DENIED, ...eph });
         const sub = i.options.getSubcommand();
         if (sub === 'status') {
           const s = listener.sessions.get(i.guildId);
-          return i.reply({ content: s ? `🎙️ Listening in <#${s.channelId}> since <t:${Math.floor(s.startedAt / 1000)}:R> (STT: ${app.stt.name}).` : `Not listening. STT provider: ${app.stt.name}.`, ...eph });
+          return i.reply({ content: s ? `🎙️ Listening in <#${s.channelId}> since <t:${Math.floor(s.startedAt / 1000)}:R> (STT: ${app.stt.name}). Use /voice diagnostics for details.` : `Not listening. STT provider: ${app.stt.name}.`, ...eph });
         }
         if (sub === 'stop') {
           const musicActive = Boolean(music.peek(i.guildId)?.queue.current);
@@ -70,8 +77,8 @@ export function aegisCommands({ listener, music }) {
           await listener.start(i.guild, vc, { textChannelId });
           return i.editReply({
             embeds: [guardianEmbed('aegis', {
-              title: '🎙️ ALPHA is listening',
-              description: `In <#${vc}>. Only <@${i.user.id}>'s voice is processed — other members are never transcribed.\nAudio is processed in memory and sent to **${app.stt.name}** for transcription; nothing is recorded to disk.\nSay **"ALPHA, stop listening"** or use \`/listen stop\`.`,
+              title: `🎙️ ${app.config.voice.wakeWord} is listening`,
+              description: `In <#${vc}>. Only people allowed to use ${app.config.voice.wakeWord} here (the server owner and trusted users/roles) are transcribed — everyone else's audio is ignored.\nAudio is processed in memory and sent to **${app.stt.name}** for transcription; nothing is recorded to disk.\nSay **"${app.config.voice.wakeWord}, stop listening"** or use \`/listen stop\`.`,
             })],
           });
         } catch (err) {
@@ -86,9 +93,24 @@ export function aegisCommands({ listener, music }) {
 
     // ---------------------------------------------------------------- music
     {
-      data: new SlashCommandBuilder().setName('play').setDescription('Play music from lawful sources')
-        .addStringOption((o) => o.setName('query').setDescription('Title / artist (or a direct https audio URL — admins)').setRequired(true).setMaxLength(200)),
+      data: new SlashCommandBuilder().setName('play').setDescription('Play music (Audius, Jamendo, Internet Archive) by name, link or playlist')
+        .addStringOption((o) => o.setName('query').setDescription('Song / artist, an Audius/Jamendo/Archive link or playlist, or a YouTube/Spotify link to match').setRequired(true).setMaxLength(300)),
       execute: (i, app) => app.runSteps(i, [{ action: 'music.play', params: { query: i.options.getString('query') } }]),
+    },
+    {
+      data: new SlashCommandBuilder().setName('search').setDescription('Search licensed music and pick a result')
+        .addStringOption((o) => o.setName('query').setDescription('Song or artist').setRequired(true).setMaxLength(200)),
+      execute: (i, app) => app.runSteps(i, [{ action: 'music.play', params: { query: i.options.getString('query'), pick: true } }]),
+    },
+    {
+      data: new SlashCommandBuilder().setName('volume').setDescription('Set playback volume').addIntegerOption((o) => o.setName('percent').setDescription('0–150').setRequired(true).setMinValue(0).setMaxValue(150)),
+      execute: (i, app) => app.runSteps(i, [{ action: 'music.volume', params: { percent: i.options.getInteger('percent') } }]),
+    },
+    { data: new SlashCommandBuilder().setName('shuffle').setDescription('Shuffle the queue'), execute: (i, app) => app.runSteps(i, [{ action: 'music.shuffle', params: {} }]) },
+    {
+      data: new SlashCommandBuilder().setName('loop').setDescription('Loop the current track or the whole queue')
+        .addStringOption((o) => o.setName('mode').setDescription('Mode').setRequired(true).addChoices({ name: 'off', value: 'off' }, { name: 'track', value: 'track' }, { name: 'queue', value: 'queue' })),
+      execute: (i, app) => app.runSteps(i, [{ action: 'music.loop', params: { mode: i.options.getString('mode') } }]),
     },
     { data: new SlashCommandBuilder().setName('skip').setDescription('Skip the current track'), execute: (i, app) => app.runSteps(i, [{ action: 'music.skip', params: {} }]) },
     { data: new SlashCommandBuilder().setName('pause').setDescription('Pause playback'), execute: (i, app) => app.runSteps(i, [{ action: 'music.pause', params: {} }]) },
@@ -149,7 +171,7 @@ export function aegisCommands({ listener, music }) {
         const m = await i.guild.members.fetch(u.id).catch(() => null);
         const p = getProfile(app.db, i.guildId, u.id);
         const cyan = Boolean(app.db.get(`SELECT 1 FROM inventory WHERE guild_id = ? AND user_id = ? AND item_id = 'aura_frame'`, i.guildId, u.id));
-        const png = await renderRankCard({ displayName: m?.displayName ?? u.username, avatar: await profileAvatar(u), level: p.level, into: p.into, needed: p.needed, rank: p.rank, aura: p.aura, xp: p.xp, streak: p.streak, title: p.title, cyanFrame: cyan });
+        const png = await renderRankCard({ displayName: m?.displayName ?? u.username, avatar: await profileAvatar(u), level: p.level, into: p.into, needed: p.needed, rank: p.rank, aura: p.aura, xp: p.xp, streak: p.streak, title: p.title, cyanFrame: cyan, serverName: displayNameOf(i.guild, getGuildSettings(app.db, i.guildId)) });
         return i.editReply({ files: [new AttachmentBuilder(png, { name: 'rank.png' })] });
       },
     },
@@ -426,7 +448,21 @@ export function aegisCommands({ listener, music }) {
           .addBooleanOption((o) => o.setName('enabled').setDescription('Send welcome cards'))
           .addStringOption((o) => o.setName('format').setDescription('Card format').addChoices({ name: 'static PNG', value: 'png' }, { name: 'animated GIF', value: 'gif' }, { name: 'MP4 video', value: 'mp4' }))
           .addStringOption((o) => o.setName('message').setDescription('Template: {mention} {name} {server} {count}').setMaxLength(500))
-          .addStringOption((o) => o.setName('leave_message').setDescription('Template: {name} {server}').setMaxLength(500)))
+          .addStringOption((o) => o.setName('leave_message').setDescription('Template: {name} {server}').setMaxLength(500))
+          .addStringOption((o) => o.setName('tagline').setDescription('Card tagline, e.g. HAS ENTERED SOUL SOCIETY').setMaxLength(40))
+          .addAttachmentOption((o) => o.setName('background').setDescription('Custom card background (PNG/JPG/WebP, ≤ 8 MB, 1200×500 recommended)'))
+          .addBooleanOption((o) => o.setName('reset_background').setDescription('Use the default background again')))
+        .addSubcommand((s) => s.setName('trusted').setDescription('Who may use ALPHA here (besides the server owner)')
+          .addStringOption((o) => o.setName('action').setDescription('Action').setRequired(true).addChoices({ name: 'add', value: 'add' }, { name: 'remove', value: 'remove' }, { name: 'list', value: 'list' }))
+          .addUserOption((o) => o.setName('user').setDescription('Trusted user'))
+          .addRoleOption((o) => o.setName('role').setDescription('Trusted role')))
+        .addSubcommand((s) => s.setName('music').setDescription('Music defaults')
+          .addIntegerOption((o) => o.setName('volume').setDescription('Default volume 0–150').setMinValue(0).setMaxValue(150))
+          .addRoleOption((o) => o.setName('dj_role').setDescription('Only this role (and admins/requesters) can skip/stop/shuffle'))
+          .addBooleanOption((o) => o.setName('clear_dj_role').setDescription('Remove the DJ role restriction'))
+          .addBooleanOption((o) => o.setName('announce_tracks').setDescription('Post "Now playing" messages')))
+        .addSubcommand((s) => s.setName('branding').setDescription('Name shown on welcome cards and messages')
+          .addStringOption((o) => o.setName('name').setDescription('Display name (empty = this server\'s name)').setMaxLength(60)))
         .addSubcommand((s) => s.setName('reports').setDescription('Scheduled activity reports')
           .addBooleanOption((o) => o.setName('daily').setDescription('Daily report'))
           .addStringOption((o) => o.setName('daily_time').setDescription('HH:MM'))
@@ -468,6 +504,58 @@ export function aegisCommands({ listener, music }) {
           if (f) set('welcome.format', f);
           if (m) set('welcome.message', m);
           if (l) set('welcome.leaveMessage', l);
+          const tg = i.options.getString('tagline');
+          if (tg) set('welcome.tagline', tg.toUpperCase());
+          if (i.options.getBoolean('reset_background')) {
+            removeGuildBackground(app.config, i.guildId);
+            set('welcome.background', null);
+          }
+          const att = i.options.getAttachment('background');
+          if (att) {
+            await i.deferReply(eph);
+            try {
+              const file = await saveGuildBackground(app.config, i.guildId, att);
+              set('welcome.background', file);
+            } catch (err) {
+              return i.editReply(`Background not saved: ${err.message}`);
+            }
+            return i.editReply('✅ Saved. Preview it with /welcome-test.');
+          }
+        }
+        if (sub === 'trusted') {
+          const action = i.options.getString('action');
+          const user = i.options.getUser('user');
+          const role = i.options.getRole('role');
+          if (action === 'list') {
+            return i.reply({ content: `ALPHA access here: the server owner${s.alpha.trustedUserIds.length ? `, ${s.alpha.trustedUserIds.map((u) => `<@${u}>`).join(', ')}` : ''}${s.alpha.trustedRoleIds.length ? `, roles ${s.alpha.trustedRoleIds.map((r) => `<@&${r}>`).join(', ')}` : ''}.`, allowedMentions: { parse: [] }, ...eph });
+          }
+          if (!user && !role) return i.reply({ content: 'Choose a user or a role.', ...eph });
+          if (user?.bot) return i.reply({ content: 'Bots cannot be trusted with ALPHA.', ...eph });
+          const edit = (key, id) => {
+            const set2 = new Set(s.alpha[key]);
+            action === 'add' ? set2.add(id) : set2.delete(id);
+            if (set2.size > 25) throw new Error('At most 25 trusted entries.');
+            set(`alpha.${key}`, [...set2]);
+          };
+          try {
+            if (user) edit('trustedUserIds', user.id);
+            if (role) edit('trustedRoleIds', role.id);
+          } catch (err) {
+            return i.reply({ content: err.message, ...eph });
+          }
+        }
+        if (sub === 'music') {
+          const v = i.options.getInteger('volume');
+          const dj = i.options.getRole('dj_role');
+          const at = i.options.getBoolean('announce_tracks');
+          if (v != null) set('music.volume', v);
+          if (dj) set('music.djRoleId', dj.id);
+          if (i.options.getBoolean('clear_dj_role')) set('music.djRoleId', null);
+          if (at != null) set('music.announceTracks', at);
+        }
+        if (sub === 'branding') {
+          const n = i.options.getString('name')?.trim();
+          set('branding.displayName', n ? n : null);
         }
         if (sub === 'reports') {
           const d = i.options.getBoolean('daily');
@@ -498,13 +586,14 @@ export function aegisCommands({ listener, music }) {
         await i.deferReply();
         const user = i.options.getUser('member') ?? i.user;
         const member = await i.guild.members.fetch(user.id);
-        const card = await buildWelcomeCard(member, { config: app.config, format: i.options.getString('format') ?? 'png', logger: app.logger });
+        const card = await buildWelcomeCard(member, { config: app.config, settings: getGuildSettings(app.db, i.guildId), format: i.options.getString('format') ?? 'png', logger: app.logger });
         return i.editReply({
-          content: card.usedOriginal ? '' : '⚠️ Original background not found — showing the stand-in. Place it at `assets/welcome/background.png`.',
+          content: card.usedOriginal ? '' : '⚠️ No background image configured — showing the built-in design. Upload one with `/setup welcome background:`.',
           files: [new AttachmentBuilder(card.buffer, { name: `welcome.${card.format}` })],
         });
       },
     },
+    ...configCommands({ listener, music }),
   ];
 }
 
