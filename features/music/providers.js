@@ -95,7 +95,11 @@ const audiusTrack = (t, appName) => ({
   plays: t.play_count ?? 0,
   input: `${AUDIUS}/tracks/${encodeURIComponent(t.id)}/stream?app_name=${encodeURIComponent(appName)}`,
 });
-const audiusPlayable = (t) => t && !t.is_delete && t.is_available !== false && t.is_streamable !== false && !t.is_stream_gated && t.access?.stream !== false && !t.stream_conditions;
+// Uploads named after YouTube-ripping tools are almost certainly re-uploads of
+// someone else's recording; never offer them as playable.
+const RIPPED_UPLOAD = /\b(y2mate|yt1s|ytmp3|savefrom|ssyoutube|flvto|mp3juices|onlymp3|youtube\s*to\s*mp3)\b/i;
+export const looksRipped = (t) => RIPPED_UPLOAD.test(`${t.title ?? ''} ${t.description ?? ''}`);
+const audiusPlayable = (t) => Boolean(t) && !looksRipped(t) && !t.is_delete && t.is_available !== false && t.is_streamable !== false && !t.is_stream_gated && t.access?.stream !== false && !t.stream_conditions;
 
 export const audius = {
   id: 'audius',
@@ -381,6 +385,33 @@ export function cleanVideoTitle(t) {
 
 // ------------------------------------------------------------------ registry
 
+// ------------------------------------------------------------------ metadata-only catalogue
+
+/**
+ * Apple's iTunes Search API (free, no key): broad catalogue metadata so users
+ * can see that a song exists. These results are NEVER played — Apple does not
+ * license rebroadcasting its catalogue — they are shown as "metadata only"
+ * with a link, next to playable alternatives.
+ */
+export const itunes = {
+  id: 'itunes',
+  name: 'Apple Music catalogue',
+  enabled: (config) => config.music.metadataCatalog !== false,
+  async search(query, { fetchImpl, limit = 5 }) {
+    const data = await http(`https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&entity=song&limit=${limit}`, { fetchImpl });
+    return (data.results ?? []).map((t) => ({
+      provider: 'itunes',
+      id: String(t.trackId),
+      title: t.trackName,
+      artist: t.artistName ?? null,
+      durationMs: t.trackTimeMillis ?? 0,
+      page: t.trackViewUrl ?? null,
+      playable: false,
+      license: 'Metadata only — not licensed for bot playback',
+    }));
+  },
+};
+
 export const SEARCH_PROVIDERS = { audius, jamendo, archive, radio, local };
 export const LINK_PROVIDERS = [audius, jamendo, archive];
 
@@ -394,8 +425,9 @@ const WEIGHT = { local: 6, audius: 4, jamendo: 3, archive: 0, radio: -5 };
  * Search all enabled providers in parallel. Returns ranked candidates, the
  * providers that failed, and whether the choice is ambiguous.
  */
-export async function searchTracks(query, { config, fetchImpl = fetch, logger, limit = 5 } = {}) {
+export async function searchTracks(query, { config, fetchImpl = fetch, logger, limit = 5, withMetadata = false } = {}) {
   const providers = enabledProviders(config);
+  const metaPromise = withMetadata && itunes.enabled(config) ? itunes.search(query, { fetchImpl, limit: 5 }).catch(() => []) : Promise.resolve([]);
   const settled = await Promise.allSettled(providers.map((p) => p.search(query, { config, fetchImpl, limit: 6 })));
   const results = [];
   const failed = [];
@@ -406,12 +438,16 @@ export async function searchTracks(query, { config, fetchImpl = fetch, logger, l
       logger?.warn('music provider search failed', { provider: providers[i].id, code: s.reason?.code, err: s.reason?.message });
     }
   });
-  for (const t of results) t.score = matchScore(query, t) + (WEIGHT[t.provider] ?? 0) + Math.min(5, Math.log10(1 + (t.plays ?? 0)));
+  for (const t of results) {
+    t.playable = true;
+    t.score = matchScore(query, t) + (WEIGHT[t.provider] ?? 0) + Math.min(5, Math.log10(1 + (t.plays ?? 0)));
+  }
   results.sort((a, b) => b.score - a.score);
   const strong = results.filter((t) => t.score >= 45);
   const top = strong[0];
   const ambiguous = Boolean(top && strong[1] && top.score < 95 && strong[1].score >= top.score - 8);
-  return { results: strong.slice(0, limit), weak: results.slice(0, limit), ambiguous, failed };
+  const metadata = (await metaPromise).filter((m) => matchScore(query, m) >= 45);
+  return { results: strong.slice(0, limit), weak: results.slice(0, limit), ambiguous, failed, metadata };
 }
 
 /**
@@ -457,7 +493,13 @@ export async function streamInput(track, { fetchImpl } = {}) {
   return track.input;
 }
 
-const PROVIDER_LABEL = { local: 'local library', audius: 'Audius', jamendo: 'Jamendo', archive: 'Internet Archive', radio: 'internet radio', url: 'direct link' };
+const PROVIDER_LABEL = { local: 'local library', audius: 'Audius', jamendo: 'Jamendo', archive: 'Internet Archive', radio: 'internet radio', url: 'direct link', itunes: 'Apple Music catalogue (metadata only)' };
+
+export function formatMs(ms) {
+  if (!ms) return 'live/unknown';
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
 
 export function describeTrack(t) {
   const label = `${t.title}${t.artist ? ` — ${t.artist}` : ''}`;

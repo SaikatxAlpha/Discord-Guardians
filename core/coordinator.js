@@ -18,8 +18,8 @@ import { normName } from './discord/resolve.js';
 
 /** Low-impact actions that may run without confirmation even when a voice transcript is uncertain. */
 const SAFE_WHEN_UNCERTAIN = new Set([
-  'system.help', 'system.status', 'music.play', 'music.skip', 'music.pause', 'music.resume', 'music.stop', 'music.queue',
-  'music.nowplaying', 'music.volume', 'music.shuffle', 'music.loop', 'report.activity', 'report.moderation', 'research.run', 'voice.stop_listening',
+  'system.help', 'system.status', 'music.play', 'music.search', 'music.skip', 'music.pause', 'music.resume', 'music.stop', 'music.queue',
+  'music.nowplaying', 'music.volume', 'music.shuffle', 'music.loop', 'music.leave', 'music.clear', 'music.remove', 'music.move', 'report.activity', 'report.moderation', 'research.run', 'voice.stop_listening',
 ]);
 
 /** Steps that produce a context reference usable by later steps. */

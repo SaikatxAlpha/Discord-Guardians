@@ -278,7 +278,12 @@ export class GuardianBot {
     heartbeat(this.db, this.name, { status, startedAt: this.startedAt, info: { guilds: this.client.guilds?.cache.size ?? 0, ping: this.client.ws?.ping ?? null, user: this.client.user?.tag ?? null } });
   }
 
-  async start() {
+  /**
+   * @param {{manageProcess?: boolean}} [opts] false when several guardians share
+   *   one process (apps/single.js): the caller then owns signals and exiting.
+   */
+  async start({ manageProcess = true } = {}) {
+    this.manageProcess = manageProcess;
     this.client.on(Events.InteractionCreate, (i) => this.onInteraction(i));
     this.client.on(Events.GuildCreate, (g) => {
       this.logger.info('joined server', { guildId: g.id, members: g.memberCount });
@@ -298,13 +303,15 @@ export class GuardianBot {
       for (const guild of c.guilds.cache.values()) await this.initGuild(guild).catch((err) => this.logger.warn('server init failed', { guildId: guild.id, err: err.message }));
       await this.onReady?.(c);
     });
-    process.on('unhandledRejection', (err) => this.logger.error('unhandled rejection', { err }));
-    process.on('uncaughtException', (err) => {
-      this.logger.error('uncaught exception — exiting for restart', { err });
-      this.shutdown(1);
-    });
-    for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.on(sig, () => this.shutdown(0));
-    process.on('message', (m) => m?.type === 'shutdown' && this.shutdown(0));
+    if (manageProcess) {
+      process.on('unhandledRejection', (err) => this.logger.error('unhandled rejection', { err }));
+      process.on('uncaughtException', (err) => {
+        this.logger.error('uncaught exception — exiting for restart', { err });
+        this.shutdown(1);
+      });
+      for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.on(sig, () => this.shutdown(0));
+      process.on('message', (m) => m?.type === 'shutdown' && this.shutdown(0));
+    }
     this.beat('starting');
     try {
       await this.client.login(this.config[this.name].token);
@@ -322,8 +329,9 @@ export class GuardianBot {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     this.logger.info('shutting down…');
-    const force = setTimeout(() => process.exit(code || 1), 10000);
-    force.unref();
+    const exit = this.manageProcess !== false;
+    const force = exit ? setTimeout(() => process.exit(code || 1), 10000) : null;
+    force?.unref();
     try {
       for (const t of this.timers) clearInterval(t);
       await this.scheduler?.stop();
@@ -337,7 +345,7 @@ export class GuardianBot {
       this.db.close();
       this.logger.info('shutdown complete');
       await this.logger.close();
-      process.exit(code);
+      if (exit) process.exit(code);
     }
   }
 }

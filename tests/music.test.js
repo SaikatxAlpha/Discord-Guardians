@@ -7,6 +7,8 @@ import { MusicQueue } from '../features/music/queue.js';
 import { GuildMusic, MusicManager } from '../features/music/manager.js';
 import { searchTracks, validateDirectUrl, searchLocal, resolveLink, parsePlaylistFile, matchScore, cleanVideoTitle, MusicError, describeTrack } from '../features/music/providers.js';
 import { memoryLogger } from '../core/logger.js';
+import { PermissionFlagsBits } from 'discord.js';
+import { enqueueTrack, targetVoiceChannel } from '../apps/aegis/music.js';
 import { memDb, tempDir, testConfig } from './helpers.js';
 
 /** MOCK voice layer: a player that emits the same state transitions as @discordjs/voice. */
@@ -18,12 +20,19 @@ class FakePlayer extends EventEmitter {
   }
   set(status) {
     const old = this.state;
-    this.state = { status };
+    // Like @discordjs/voice, non-idle states carry the resource being played.
+    this.state = status === 'idle' ? { status } : { status, resource: old.resource };
     this.emit('stateChange', old, this.state);
   }
   play(res) {
     this.played.push(res.track.title);
-    this.set('playing');
+    const old = this.state;
+    if (old.status !== 'idle') this.emit('stateChange', old, (this.state = { status: 'idle' }));
+    const prev = this.state;
+    this.state = { status: res.silent || res.stall ? 'buffering' : 'playing', resource: res };
+    this.emit('stateChange', prev, this.state);
+    if (res.silent) setTimeout(() => this.set('idle'), 1); // stream ended without audio
+    // res.stall: stays buffering forever (no audio ever arrives)
   }
   stop() {
     if (this.state.status === 'idle') return false;
@@ -46,7 +55,7 @@ class FakePlayer extends EventEmitter {
   }
 }
 
-function fakeAdapter({ failResource = new Set(), reconnect = true } = {}) {
+function fakeAdapter({ failResource = new Set(), silent = new Set(), stall = new Set(), reconnect = true } = {}) {
   const a = {
     connects: 0,
     players: [],
@@ -68,12 +77,13 @@ function fakeAdapter({ failResource = new Set(), reconnect = true } = {}) {
     },
     async createResource(track) {
       if (failResource.has(track.title)) throw new MusicError('unavailable', `cannot open ${track.title}`);
-      return { track, volume: { setVolume: (v) => a.volumes.push(v) } };
+      return { track, silent: silent.has(track.title), stall: stall.has(track.title), volume: { setVolume: (v) => a.volumes.push(v) } };
     },
     waitReconnect: async () => reconnect,
     subscribe() {},
-    disconnect() {
+    disconnect(_conn, { force = false } = {}) {
       a.disconnected++;
+      a.lastForce = force;
     },
   };
   return a;
@@ -167,7 +177,7 @@ test('volume applies to the live stream and persists; loop modes; skip is not un
   await gm.enqueue(t('song'), { voiceChannelId: 'vc' });
   assert.equal(gm.setVolume(45), 45);
   assert.deepEqual(adapter.volumes, [0.7, 0.45]);
-  assert.throws(() => gm.setVolume(500), /between 0 and 150/);
+  assert.throws(() => gm.setVolume(500), /between 0 and 100/);
   gm.setLoop('track');
   adapter.players[0].set('idle'); // natural end → replays
   await tick();
@@ -214,7 +224,85 @@ test('stop clears everything; pause/resume/skip report state honestly', async ()
   assert.equal(gm.resume(), true);
   await gm.stop();
   assert.equal(gm.queue.length, 0);
+  assert.equal(gm.queue.current, null);
+  assert.ok(gm.connection, '/stop stays connected (Jockie-style); /leave disconnects');
+  assert.equal(await gm.leave(), true);
   assert.equal(gm.connection, null);
+  assert.equal(gm.adapter.disconnected, 1);
+  assert.equal(gm.adapter.lastForce, true, 'leave forces a real disconnect even if ALPHA shares the connection');
+  assert.equal(await gm.leave(), false, 'leaving twice is harmless');
+});
+
+test('"Now playing" only after audio actually flows; streams that never start are skipped and reported', async () => {
+  const adapter = fakeAdapter({ silent: new Set(['dead']), failResource: new Set(['gone']) });
+  const gm = gmFor({ adapter });
+  const starts = [];
+  gm.on('trackStart', (tr, info) => starts.push([tr.title, info.viaRequest]));
+  const r = await gm.enqueueMany([t('dead'), t('gone'), t('good')], { voiceChannelId: 'vc' });
+  assert.equal(r.started.title, 'good', 'only the track that produced audio counts as started');
+  assert.deepEqual(r.errors.map((e) => e.track.title), ['dead', 'gone']);
+  assert.match(r.errors[0].error.message, /ended before any audio/);
+  assert.deepEqual(starts, [['good', true]], 'trackStart only for real playback, flagged as part of the request');
+
+  const only = gmFor({ guildId: 'g2', adapter: fakeAdapter({ silent: new Set(['dead']) }) });
+  const r2 = await only.enqueue(t('dead'), { voiceChannelId: 'vc' });
+  assert.equal(r2.started, null);
+  assert.equal(r2.errors.length, 1);
+  assert.equal(only.queue.current, null, 'nothing left pretending to play');
+});
+
+test('a stream that stalls is abandoned after the start timeout', async () => {
+  const adapter = fakeAdapter({ stall: new Set(['stuck']) });
+  const gm = gmFor({ adapter, startTimeoutMs: 30 });
+  const r = await gm.enqueueMany([t('stuck'), t('fine')], { voiceChannelId: 'vc' });
+  assert.match(r.errors[0].error.message, /No audio arrived/);
+  assert.equal(r.started.title, 'fine');
+  assert.equal(gm.status, 'playing');
+});
+
+test('clear, remove and move edit only the upcoming queue', async () => {
+  const gm = gmFor();
+  await gm.enqueueMany([t('now'), t('a'), t('b'), t('c')], { voiceChannelId: 'vc' });
+  assert.equal((await gm.moveTrack(3, 1)).title, 'c');
+  assert.equal((await gm.removeAt(2)).title, 'a');
+  assert.deepEqual(gm.queue.tracks.map((x) => x.title), ['c', 'b']);
+  await assert.rejects(gm.removeAt(5), /between 1 and 2/);
+  assert.equal(await gm.clearQueue(), 2);
+  assert.equal(gm.queue.current.title, 'now', 'current track keeps playing');
+  assert.equal(gm.status, 'playing');
+});
+
+test('handler replies are honest: Now playing / Queued / the real error', async () => {
+  const gm = gmFor({ adapter: fakeAdapter({ silent: new Set(['broken']) }) });
+  const ctx = { guild: { id: 'g' }, music: { get: () => gm }, request: { userId: 'u1' } };
+  const first = await enqueueTrack(ctx, { ...t('first'), id: '1', artist: 'Artist', durationMs: 61000 }, 'vc', 'tc');
+  assert.match(first.message, /^▶️ Now playing \*\*first/);
+  const second = await enqueueTrack(ctx, { ...t('second'), id: '2' }, 'vc', 'tc');
+  assert.match(second.message, /^➕ Queued at #1/);
+  await gm.leave();
+  const bad = await enqueueTrack(ctx, { ...t('broken'), id: '3' }, 'vc', 'tc');
+  assert.equal(bad.ok, false);
+  assert.match(bad.message, /Couldn't play \*\*broken/);
+  assert.doesNotMatch(bad.message, /Now playing/);
+});
+
+test('voice channel checks: must be in voice; Connect/Speak permissions; one channel per server', async () => {
+  const perms = (missing) => ({ has: (f) => f !== missing });
+  const mk = ({ inVoice = true, missing = null, busy = null } = {}) => ({
+    guild: {
+      id: 'g',
+      members: { fetch: async () => ({ voice: { channelId: inVoice ? 'vc1' : null } }), me: { id: 'bot' } },
+      channels: { cache: new Map([['vc1', { id: 'vc1', permissionsFor: () => perms(missing) }]]), fetch: async () => null },
+    },
+    request: { userId: 'u', source: 'text' },
+    music: { peek: () => busy },
+  });
+  assert.match((await targetVoiceChannel(mk({ inVoice: false }))).error, /Join a voice channel/);
+  assert.match((await targetVoiceChannel(mk({ missing: PermissionFlagsBits.Connect }))).error, /permission to \*\*connect\*\*/);
+  assert.match((await targetVoiceChannel(mk({ missing: PermissionFlagsBits.Speak }))).error, /permission to \*\*speak\*\*/);
+  const busy = { connection: {}, voiceChannelId: 'vc9', queue: { current: t('x') } };
+  assert.match((await targetVoiceChannel(mk({ busy }))).error, /already playing in <#vc9>/);
+  assert.deepEqual(await targetVoiceChannel(mk()), { channelId: 'vc1' });
 });
 
 // ------------------------------------------------------------------ providers (MOCK HTTP)
@@ -329,6 +417,23 @@ test('Jamendo is optional (free client id) and the local folder is never require
   const dir = tempDir();
   fs.writeFileSync(path.join(dir, 'The Weeknd - Blinding Lights.mp3'), '');
   assert.equal((await searchLocal('blinding lights', { dir }))[0].artist, 'The Weeknd');
+});
+
+test('search marks playable results and adds metadata-only catalogue matches; ripped uploads are excluded', async () => {
+  const { fetchImpl } = router([
+    [/api\.audius\.co\/v1\/tracks\/search/, { data: [
+      audiusTrackJson('r1', 'her (y2mate.com)', 'Ripper'),
+      audiusTrackJson('ok1', 'her (lofi cover)', 'Bedroom Keys'),
+    ] }],
+    [/archive\.org\/advancedsearch/, { response: { docs: [] } }],
+    [/itunes\.apple\.com\/search/, { results: [{ trackId: 77, trackName: 'her', artistName: 'JVKE', trackTimeMillis: 175000, trackViewUrl: 'https://music.apple.com/x' }] }],
+  ]);
+  const r = await searchTracks('her jvke', { config: cfg(), fetchImpl, withMetadata: true });
+  assert.ok(!r.results.some((x) => x.id === 'r1'), 'ripped upload never offered');
+  assert.ok(r.results.length > 0 && r.results.every((x) => x.playable === true));
+  assert.deepEqual(r.metadata.map((m) => [m.title, m.artist, m.playable]), [['her', 'JVKE', false]]);
+  const off = await searchTracks('her jvke', { config: cfg({ metadataCatalog: false }), fetchImpl, withMetadata: true });
+  assert.deepEqual(off.metadata, []);
 });
 
 test('ranking helpers', () => {

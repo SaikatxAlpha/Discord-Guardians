@@ -55,6 +55,30 @@ The setup script:
 
 The Git repository must be **public**, or you need a deploy key/token for `git clone`.
 
+## 3b. Deploy on Bot-Hosting.net (free Node.js panel, ~256 MB RAM)
+
+This panel runs Node.js 22 directly, without Docker. Its installer blocks `ffmpeg-static`'s download script. That's fine: `ffmpeg-static` is an *optional* dependency, and music uses the built-in WebAssembly decoder instead (see [MUSIC.md](MUSIC.md#audio-engine-works-without-ffmpeg)).
+
+1. **Upload the code:** connect the Git repository in the panel, or upload the project **without** `node_modules`, `data/` and `.env`.
+2. **Create `.env`** in the panel's file manager from `.env.production.example`. Set:
+   - `KNIGHT_TOKEN`, `AEGIS_TOKEN`, `APP_ENV=production`, `COMMAND_SCOPE=global`
+   - `DATA_DIR=./data`, `MUSIC_MAX_STREAMS=2`
+   - optionally `GROQ_API_KEY`, `JAMENDO_CLIENT_ID`
+
+   Never paste tokens anywhere else.
+3. **Startup settings:**
+   - **Main file / start command:** `apps/single.js` (both bots in one process, about 110 MB less than `npm start`).
+   - If the panel takes a full command: `node --disable-warning=ExperimentalWarning apps/single.js`.
+4. **Install dependencies:** the panel runs `npm install` on start. Warnings about `ffmpeg-static` are expected. No build step is needed.
+5. **Register slash commands once,** after `/play`-style command changes. Run `npm run register` from the panel console. If the panel has no console, run it on your PC with the same tokens; registration is per application, not per host.
+6. **Start the server.** The console should show `KNIGHT online`, `AEGIS online` and a line like `music audio engine … built-in decoder (no FFmpeg): MP3, Ogg/Opus, WebM/Opus`.
+7. **Verify in Discord:**
+   - `/voice diagnostics` shows the engine.
+   - `/play lofi` in a voice channel: "▶️ Now playing" appears only once audio is flowing.
+   - `/welcome-test` shows your saved welcome message inside the card.
+
+Optional: if the panel lets you upload a static `ffmpeg` binary (Linux x64), set `FFMPEG_PATH=./bin/ffmpeg`. Every audio format then plays, and MP4 welcome cards work.
+
 ### Environment variables (`.env.production`)
 
 | Variable | Required | Purpose |
@@ -65,7 +89,9 @@ The Git repository must be **public**, or you need a deploy key/token for `git c
 | `JAMENDO_CLIENT_ID` | optional | Adds Jamendo (Creative Commons) to music search — free at devportal.jamendo.com |
 | `OWNER_ID` | optional | Bot operator. Has no power in other servers unless `OPERATOR_GLOBAL_ACCESS=true` |
 | `STT_LANGUAGE`, `STT_MODEL`, `STT_DAILY_LIMIT`, `STT_GUILD_DAILY_LIMIT` | optional | Voice defaults and quotas |
-| `MUSIC_PROVIDERS`, `MUSIC_MAX_STREAMS` | optional | Music sources and global ffmpeg cap |
+| `MUSIC_PROVIDERS`, `MUSIC_MAX_STREAMS` | optional | Music sources and the global concurrent-stream cap (2 on 256 MB hosts) |
+| `MUSIC_METADATA_CATALOG` | optional | `true` (default): look titles up in the free iTunes Search API (metadata only, no key) |
+| `FFMPEG_PATH` | optional | ffmpeg binary. Without it music uses the built-in MP3/Opus decoder; MP4 welcome cards fall back to GIF/PNG |
 | `HEALTH_PORT` | optional | HTTP `/health` endpoint for hosts that need a port |
 | `DATA_DIR=/app/data` | preset | Database, backups, uploaded welcome backgrounds (the volume) |
 

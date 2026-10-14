@@ -13,6 +13,8 @@ import { createCanvas, loadImage, GlobalFonts } from '@napi-rs/canvas';
 import gifenc from 'gifenc';
 import { ROOT } from '../../config/env.js';
 import { SERVER_NAME } from '../../config/defaults.js';
+import { layoutMessage, drawMessage } from './richText.js';
+import { detectFfmpeg } from '../music/audioEngine.js';
 
 export const CARD_W = 1200;
 export const CARD_H = 500;
@@ -40,6 +42,8 @@ export function registerFonts() {
     // Bundled so names like "𓆩 𝐕𝐎𝐈𝐃𝐖𝐎𝐑𝐊𝐒 𓆪" render on Linux hosts too.
     ['NotoSansEgyptianHieroglyphs-Regular.ttf', 'Noto Sans Egyptian Hieroglyphs'],
     ['NotoSansMath-Regular.ttf', 'Noto Sans Math'],
+    // Monochrome emoji so emoji in welcome messages render on hosts without an emoji font.
+    ['NotoEmoji.ttf', 'Noto Emoji'],
   ];
   for (const [file, family] of fonts) {
     const p = path.join(dir, file);
@@ -50,6 +54,9 @@ export function registerFonts() {
 // Fallback chain covers CJK, symbols, hieroglyphs (𓆩 𓆪) and emoji on Windows.
 const NAME_FONT = (px) => `bold ${px}px Rajdhani, "Segoe UI", "Segoe UI Symbol", "Segoe UI Historic", "Noto Sans Math", "Noto Sans Egyptian Hieroglyphs", "Yu Gothic UI", "Microsoft YaHei UI", "Malgun Gothic", "Nirmala UI", "Noto Sans CJK SC", "Segoe UI Emoji", "Noto Color Emoji", "DejaVu Sans", sans-serif`;
 const TITLE_FONT = (px) => `900 ${px}px Cinzel, "Segoe UI", "DejaVu Serif", serif`;
+const MESSAGE_FONT = (style, px) =>
+  `${style.italic ? 'italic ' : ''}${style.bold ? 700 : 600} ${px}px ${style.code ? '"Cascadia Mono", "DejaVu Sans Mono", monospace, ' : ''}Rajdhani, "Segoe UI", "Segoe UI Symbol", "Noto Sans Math", "Noto Sans Egyptian Hieroglyphs", "Yu Gothic UI", "Microsoft YaHei UI", "Nirmala UI", "Segoe UI Emoji", "Noto Color Emoji", "Noto Emoji", "DejaVu Sans", sans-serif`;
+const MESSAGE_COLORS = { text: '#ede9fe', bold: '#ffffff', code: '#a5f3fc', glow: '#a855f7' };
 const SMALL_FONT = (px) => `600 ${px}px "Segoe UI Historic", "Segoe UI Symbol", "Cambria Math", "Noto Sans Math", "Noto Sans Egyptian Hieroglyphs", "Segoe UI", "Noto Color Emoji", "DejaVu Sans", sans-serif`;
 
 export function findBackground(explicit) {
@@ -165,18 +172,19 @@ export function drawFallbackBackground(ctx, w, h) {
   ctx.restore();
 }
 
-function drawAtmosphere(ctx, w, h, layout) {
+// h is the hero height the layout refers to; fullH (>= h) also covers the message panel area.
+function drawAtmosphere(ctx, w, h, layout, fullH = h) {
   // Readability vignette that keeps the original art visible.
   const v = ctx.createRadialGradient(w / 2, h / 2, h * 0.3, w / 2, h / 2, w * 0.75);
   v.addColorStop(0, 'rgba(5,2,16,0)');
   v.addColorStop(1, 'rgba(5,2,16,0.72)');
   ctx.fillStyle = v;
-  ctx.fillRect(0, 0, w, h);
+  ctx.fillRect(0, 0, w, fullH);
   const band = ctx.createLinearGradient(0, h * 0.62, 0, h);
   band.addColorStop(0, 'rgba(8,3,20,0)');
   band.addColorStop(1, 'rgba(8,3,20,0.75)');
   ctx.fillStyle = band;
-  ctx.fillRect(0, h * 0.62, w, h * 0.38);
+  ctx.fillRect(0, h * 0.62, w, fullH - h * 0.62);
   // Spirit glow behind the avatar.
   const ax = layout.avatarX * w;
   const ay = layout.avatarY * h;
@@ -185,7 +193,7 @@ function drawAtmosphere(ctx, w, h, layout) {
   glow.addColorStop(0.5, 'rgba(34,211,238,0.10)');
   glow.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = glow;
-  ctx.fillRect(0, 0, w, h);
+  ctx.fillRect(0, 0, w, fullH);
 }
 
 function makeParticles(seed, count) {
@@ -362,17 +370,66 @@ function drawTexts(ctx, w, h, layout, name, scale, { tagline = TAGLINE, serverNa
   ctx.restore();
 }
 
+function roundedRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/** Neon glass panel that holds the welcome message under the hero section. */
+function drawMessagePanel(ctx, panel, scale) {
+  ctx.save();
+  roundedRect(ctx, panel.x, panel.y, panel.w, panel.h, 22 * scale);
+  ctx.fillStyle = 'rgba(10, 4, 26, 0.72)';
+  ctx.fill();
+  const border = ctx.createLinearGradient(panel.x, 0, panel.x + panel.w, 0);
+  border.addColorStop(0, VIOLET);
+  border.addColorStop(0.5, '#e9d5ff');
+  border.addColorStop(1, CYAN);
+  ctx.strokeStyle = border;
+  ctx.lineWidth = 2.5 * scale;
+  ctx.shadowColor = VIOLET;
+  ctx.shadowBlur = 18 * scale;
+  ctx.stroke();
+  ctx.restore();
+}
+
 /**
  * Prepare reusable layers (background and foreground) for one member.
  * @param {{background?:string|null, avatar?:Buffer|null, displayName:string, width?:number}} opts
  */
-export async function prepareCard({ background = findBackground(), avatar = null, displayName, width = CARD_W, tagline = TAGLINE, serverName = SERVER_NAME } = {}) {
+export async function prepareCard({ background = findBackground(), avatar = null, displayName, width = CARD_W, tagline = TAGLINE, serverName = SERVER_NAME, message = '', emojiImages = new Map() } = {}) {
   registerFonts();
   const w = width;
-  const h = Math.round((width * CARD_H) / CARD_W);
+  const heroH = Math.round((width * CARD_H) / CARD_W); // the original card area; layout fractions refer to it
   const scale = w / CARD_W;
   const layout = loadLayout();
   const name = sanitizeDisplayName(displayName);
+
+  // The configured welcome message gets its own panel below the tagline, and
+  // the card grows to fit it, so it can never overlap the avatar/name/tagline.
+  let messageLayout = null;
+  let panel = null;
+  if (message && String(message).trim()) {
+    const measure = createCanvas(4, 4).getContext('2d');
+    const pad = 26 * scale;
+    const textWidth = w * 0.84 - pad * 2;
+    messageLayout = layoutMessage(measure, message, {
+      maxWidth: textWidth,
+      maxLines: 6,
+      sizes: [32, 30, 28, 26, 24, 22, 20, 18].map((px) => Math.round(px * scale)),
+      fontFor: MESSAGE_FONT,
+    });
+    if (messageLayout) {
+      const top = Math.round(layout.taglineY * heroH + 34 * scale);
+      panel = { x: Math.round(w * 0.08), y: top, w: Math.round(w * 0.84), h: Math.round(messageLayout.height + pad * 2 - messageLayout.lineHeight * 0.15), pad };
+    }
+  }
+  const h = panel ? Math.max(heroH, panel.y + panel.h + Math.round(28 * scale)) : heroH;
 
   const base = createCanvas(w, h);
   const bctx = base.getContext('2d');
@@ -385,7 +442,7 @@ export async function prepareCard({ background = findBackground(), avatar = null
       drawFallbackBackground(bctx, w, h);
     }
   } else drawFallbackBackground(bctx, w, h);
-  drawAtmosphere(bctx, w, h, layout);
+  drawAtmosphere(bctx, w, heroH, layout, h);
 
   let avatarImg = null;
   if (avatar) {
@@ -395,15 +452,31 @@ export async function prepareCard({ background = findBackground(), avatar = null
       avatarImg = null;
     }
   }
-  const R = layout.avatarRadius * h;
+  const R = layout.avatarRadius * heroH;
   const cx = layout.avatarX * w;
-  const cy = layout.avatarY * h;
+  const cy = layout.avatarY * heroH;
   const fg = createCanvas(w, h);
   const fctx = fg.getContext('2d');
   drawAvatar(fctx, cx, cy, R, avatarImg, name);
-  drawTexts(fctx, w, h, layout, name, scale, { tagline: sanitizeDisplayName(tagline, 40).toUpperCase(), serverName: sanitizeDisplayName(serverName, 48) });
+  drawTexts(fctx, w, heroH, layout, name, scale, { tagline: sanitizeDisplayName(tagline, 40).toUpperCase(), serverName: sanitizeDisplayName(serverName, 48) });
+  if (panel) {
+    const loaded = new Map();
+    for (const [id, buf] of emojiImages) {
+      try {
+        loaded.set(id, await loadImage(buf));
+      } catch {
+        /* fall back to :name: text */
+      }
+    }
+    drawMessagePanel(fctx, panel, scale);
+    drawMessage(fctx, messageLayout, { x: panel.x + panel.pad, y: panel.y + panel.pad - messageLayout.lineHeight * 0.15, width: panel.w - panel.pad * 2 }, { fontFor: MESSAGE_FONT, colors: MESSAGE_COLORS, emojiImages: loaded, scale });
+  }
 
-  return { w, h, scale, base, fg, cx, cy, R, name, usedOriginal, avatarUsed: Boolean(avatarImg), particles: makeParticles(name.length * 97 + 13, Math.round(70 * scale + 20)) };
+  return {
+    w, h, heroH, scale, base, fg, cx, cy, R, name, usedOriginal, avatarUsed: Boolean(avatarImg),
+    particles: makeParticles(name.length * 97 + 13, Math.round(70 * scale + 20)),
+    message: messageLayout ? { lines: messageLayout.plain, fontSize: messageLayout.fontSize, truncated: messageLayout.truncated, panel, taglineY: Math.round(layout.taglineY * heroH) } : null,
+  };
 }
 
 function composeFrame(ctx, card, t) {
@@ -418,7 +491,7 @@ export async function renderWelcomePng(opts) {
   const card = await prepareCard(opts);
   const canvas = createCanvas(card.w, card.h);
   composeFrame(canvas.getContext('2d'), card, 0.12);
-  return { buffer: await canvas.encode('png'), format: 'png', usedOriginal: card.usedOriginal, avatarUsed: card.avatarUsed, name: card.name };
+  return { buffer: await canvas.encode('png'), format: 'png', usedOriginal: card.usedOriginal, avatarUsed: card.avatarUsed, name: card.name, message: card.message, width: card.w, height: card.h };
 }
 
 /** Animated GIF: drifting particles, pulsing glow and rotating spirit arcs. */
@@ -435,13 +508,13 @@ export async function renderWelcomeGif(opts, { frames = 24, delayMs = 70, width 
     gif.writeFrame(applyPalette(data, palette), card.w, card.h, { palette: i === 0 ? palette : undefined, delay: delayMs, repeat: 0 });
   }
   gif.finish();
-  return { buffer: Buffer.from(gif.bytes()), format: 'gif', usedOriginal: card.usedOriginal, avatarUsed: card.avatarUsed, name: card.name };
+  return { buffer: Buffer.from(gif.bytes()), format: 'gif', usedOriginal: card.usedOriginal, avatarUsed: card.avatarUsed, name: card.name, message: card.message, width: card.w, height: card.h };
 }
 
+/** FFmpeg command for MP4 cards (FFMPEG_PATH, ffmpeg-static or system PATH), or null. */
 export function ffmpegPath() {
-  if (process.env.FFMPEG_PATH && fs.existsSync(process.env.FFMPEG_PATH)) return process.env.FFMPEG_PATH;
-  const local = path.join(ROOT, 'node_modules', 'ffmpeg-static', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
-  return fs.existsSync(local) ? local : null;
+  const info = detectFfmpeg();
+  return info.available ? info.command : null;
 }
 
 /** MP4 (H.264) via ffmpeg-static; returns null if ffmpeg is unavailable. */
@@ -472,7 +545,7 @@ export async function renderWelcomeMp4(opts, { seconds = 3, fps = 24, width = 96
   }
   proc.stdin.end();
   await done;
-  return { buffer: Buffer.concat(chunks), format: 'mp4', usedOriginal: card.usedOriginal, avatarUsed: card.avatarUsed, name: card.name };
+  return { buffer: Buffer.concat(chunks), format: 'mp4', usedOriginal: card.usedOriginal, avatarUsed: card.avatarUsed, name: card.name, message: card.message, width: card.w, height: h };
 }
 
 /**

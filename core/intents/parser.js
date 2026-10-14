@@ -198,19 +198,22 @@ const MATCHERS = [
   [/^(?:skip|next)(?:\s+(?:this|the)?\s*(?:song|track))?$/i, () => [step('music.skip', {})]],
   [/^pause(?:\s+(?:the\s+)?(?:music|song|track|playback))?$/i, () => [step('music.pause', {})]],
   [/^(?:resume|continue|unpause)(?:\s+(?:the\s+)?(?:music|song|track|playback))?$/i, () => [step('music.resume', {})]],
-  [/^stop(?:\s+(?:the\s+)?(?:music|song|playback|playing))?$|^(?:clear|end)\s+(?:the\s+)?(?:music|queue)$/i, () => [step('music.stop', {})]],
+  [/^stop(?:\s+(?:the\s+)?(?:music|song|playback|playing))?$|^end\s+(?:the\s+)?music$/i, () => [step('music.stop', {})]],
   [/^(?:show|display|list|what'?s in|what is in)(?:\s+me)?\s+(?:the\s+)?(?:music\s+)?queue$|^queue$/i, () => [step('music.queue', {})]],
   [/^(?:what'?s|what is)\s+(?:playing|this song|the song)(?:\s+now)?$|^now playing$/i, () => [step('music.nowplaying', {})]],
   [
     /^(?:set\s+(?:the\s+)?)?volume\s+(?:to\s+|at\s+)?([a-z0-9][a-z0-9 -]{0,25}?)(?:\s*(?:%|percent))?$/i,
     (m) => {
       const n = toNumber(m[1]);
-      return n == null ? null : [step('music.volume', { percent: Math.min(150, n) })];
+      return n == null ? null : [step('music.volume', { percent: Math.min(100, n) })];
     },
   ],
   [/^(?:turn\s+(?:it|the\s+(?:music|volume))\s+up|volume\s+up|louder)$/i, () => [step('music.volume', { change: 20 })]],
   [/^(?:turn\s+(?:it|the\s+(?:music|volume))\s+down|volume\s+down|quieter|softer)$/i, () => [step('music.volume', { change: -20 })]],
   [/^shuffle(?:\s+(?:the\s+)?(?:queue|playlist|music|songs))?$/i, () => [step('music.shuffle', {})]],
+  [/^(?:leave|disconnect|get out)(?:\s+(?:from\s+|of\s+)?(?:the\s+)?(?:voice|vc|channel|voice channel|call))?$/i, () => [step('music.leave', {})]],
+  [/^clear(?:\s+the)?\s+(?:queue|playlist|upcoming(?:\s+songs)?)$/i, () => [step('music.clear', {})]],
+  [/^remove\s+(?:track|song|number)\s*#?(\d{1,3})(?:\s+from\s+the\s+queue)?$/i, (m) => [step('music.remove', { position: +m[1] })]],
   [/^(?:stop\s+looping|loop\s+off|disable\s+loop(?:ing)?|no\s+loop)$/i, () => [step('music.loop', { mode: 'off' })]],
   [/^(?:loop|repeat)(?:\s+(?:the\s+|this\s+)?(song|track|queue|playlist))?$/i, (m) => [step('music.loop', { mode: /queue|playlist/i.test(m[1] ?? '') ? 'queue' : 'track' })]],
   [/^play\s+(?:the\s+song\s+|me\s+)?(.+?)(?:\s+(?:song|music))?$/i, (m) => [step('music.play', { query: m[1] })]],

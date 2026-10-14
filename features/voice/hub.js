@@ -54,6 +54,17 @@ export class VoiceHub {
     return true;
   }
 
+  /** Disconnect now, even if the ALPHA listener is using the connection. */
+  leave(guildId) {
+    this.listening.delete(guildId);
+    const conn = this.get(guildId);
+    if (conn && conn.state.status !== VoiceConnectionStatus.Destroyed) {
+      conn.destroy();
+      return true;
+    }
+    return false;
+  }
+
   destroyAll() {
     for (const guildId of this.listening) this.get(guildId)?.destroy();
     this.listening.clear();

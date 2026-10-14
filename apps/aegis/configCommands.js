@@ -6,6 +6,7 @@ import { audit } from '../../core/audit.js';
 import { guardianEmbed, safeText, STATUS_COLORS } from '../../core/discord/theme.js';
 import { guildUsageToday } from '../../ai/usage.js';
 import { activeStreams } from '../../features/music/discordAdapter.js';
+import { engineDescription } from '../../features/music/audioEngine.js';
 
 const eph = { flags: MessageFlags.Ephemeral };
 const levelOf = (i, app) => authLevel({ userId: i.user.id, config: app.config, member: i.member, guild: i.guild, settings: getGuildSettings(app.db, i.guildId) });
@@ -52,7 +53,7 @@ export function configCommands({ listener, music }) {
                   ? `capture ${median(transcribed.map((r) => r.captureMs ?? 0))} ms · STT ${median(transcribed.map((r) => r.sttMs))} ms · total ${median(transcribed.map((r) => r.totalMs))} ms\nconfidence ${median(transcribed.map((r) => r.confidence))} · pauses restored ${median(transcribed.map((r) => r.gapsFilledMs ?? 0))} ms · decode errors ${transcribed.reduce((a, r) => a + (r.decodeErrors ?? 0), 0)}`
                   : '—',
               },
-              { name: 'Music', value: `queue ${music?.peek(i.guildId)?.queue.length ?? 0} · active streams (all servers) ${activeStreams()}/${app.config.music.maxStreams}`, inline: true },
+              { name: 'Music', value: `queue ${music?.peek(i.guildId)?.queue.length ?? 0} · active streams (all servers) ${activeStreams()}/${app.config.music.maxStreams}\nengine: ${engineDescription()}`, inline: true },
             ],
             footer: 'AEGIS • audio and transcript text are never stored or shown here',
           });

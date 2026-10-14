@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning apps/launcher.js",
+    "start:single": "node --disable-warning=ExperimentalWarning apps/single.js",
     "knight": "node --disable-warning=ExperimentalWarning apps/knight/index.js",
     "aegis": "node --disable-warning=ExperimentalWarning apps/aegis/index.js",
     "register": "node --disable-warning=ExperimentalWarning apps/register-commands.js",
@@ -41,6 +42,7 @@
     "discord.js": "^14.27.0",
     "fast-xml-parser": "^5.11.2",
     "gifenc": "^1.0.3",
+    "mpg123-decoder": "^1.0.3",
     "opusscript": "^0.0.8",
     "prism-media": "^1.3.5"
   }

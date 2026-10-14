@@ -2,7 +2,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT, loadEnv, getConfig, validateConfig } from '../config/env.js';
-import { findBackground, ffmpegPath } from '../features/welcome/renderer.js';
+import { findBackground } from '../features/welcome/renderer.js';
+import { engineDescription } from '../features/music/audioEngine.js';
 
 loadEnv();
 const cfg = getConfig();
@@ -21,7 +22,7 @@ console.log(`Hosted AI ............ ${cfg.ai.provider}${cfg.ai.provider !== 'non
 console.log(`Speech-to-text ....... ${cfg.stt.provider}${cfg.stt.provider === 'groq' ? ` (${cfg.stt.model}, ${cfg.stt.dailyLimit}/day cap)` : ''}`);
 console.log(`Windows TTS .......... ${cfg.tts.enabled ? 'enabled' : 'disabled'}`);
 console.log(`Welcome background ... ${findBackground(cfg.welcome.background) ?? 'built-in design (servers can upload their own with /setup welcome)'}`);
-console.log(`ffmpeg ............... ${ffmpegPath() ?? 'NOT FOUND (music, TTS and MP4 cards disabled)'}`);
+console.log(`Music audio engine ... ${engineDescription()}`);
 console.log(`Local music (optional) ${fs.existsSync(cfg.music.localDir) ? cfg.music.localDir : 'not used'}`);
 console.log(`Database ............. ${cfg.dbPath}`);
 console.log(`Time zone ............ ${cfg.timezone}\n`);

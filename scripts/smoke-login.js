@@ -10,6 +10,7 @@ import path from 'node:path';
 import { Events } from 'discord.js';
 import { generateDependencyReport } from '@discordjs/voice';
 import { loadEnv } from '../config/env.js';
+import { engineDescription } from '../features/music/audioEngine.js';
 
 loadEnv();
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'soul-smoke-'));
@@ -46,6 +47,6 @@ for (const [name, create] of [['KNIGHT', createKnight], ['AEGIS', createAegis]])
   }
 }
 const report = generateDependencyReport();
-console.log(`Voice dependencies: opus ${/opusscript: \d/.test(report) ? 'ok' : 'missing'} · DAVE ${/@snazzah\/davey: \d/.test(report) ? 'ok' : 'missing'} · ffmpeg ${/FFmpeg\n- version: \S+/.test(report) ? 'ok' : 'missing'}`);
+console.log(`Voice dependencies: opus ${/opusscript: \d/.test(report) ? 'ok' : 'missing'} · DAVE ${/@snazzah\/davey: \d/.test(report) ? 'ok' : 'missing'} · audio engine: ${engineDescription()}`);
 fs.rmSync(tmp, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

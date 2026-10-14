@@ -1,4 +1,30 @@
-# Implementation status (production-readiness upgrade, 2026-10-13/14)
+# Implementation status
+
+## Welcome cards + Jockie-style music (2026-10-14)
+
+**Root causes fixed**
+- **Welcome message missing from the card:** the saved `/setup welcome message` was only sent as chat text and never passed to the renderer. `/welcome-test` didn't use it at all. Now one function, `composeWelcome`, builds the post for both real joins and `/welcome-test`. The message is drawn inside the card in a neon panel below the tagline, so it can't overlap the avatar, name or tagline. The panel supports:
+  - line breaks (`\n`), Unicode, emoji (bundled Noto Emoji font) and Discord custom emoji
+  - `**bold**`, `*italic*`, `__underline__`, `~~strike~~`, `` `code` ``, headings, quotes and bullets
+  - adaptive font size (32→18 px), wrapping, and an ellipsis when text is too long
+- **Music silent on Bot-Hosting.net:** FFmpeg is missing on that host and the old code required it. A built-in WebAssembly MP3 decoder plus Opus passthrough now plays Audius, Jamendo and most Archive and radio streams without FFmpeg. FFmpeg is used automatically when present (`FFMPEG_PATH`, `ffmpeg-static` or PATH).
+- **"Now playing" was sent before audio started:** it's now sent only after the player reaches the *playing* state. Streams that fail, stay silent or stall for 20 s are skipped, and the reply says why.
+- **Failure counter:** tracks that started and then kept dying never halted the queue. Fixed: only a track that finishes cleanly resets the counter.
+
+**Evidence (this PC)**
+
+| Check | Result |
+|---|---|
+| `npm test` | **137 / 137 pass**. New tests cover welcome text on the card, layout, shared composition, rich text and emoji; the audio engine (MP3 decode accuracy, resampler, sniffing, FFmpeg detection); honest "Now playing"; stall timeout; clear/remove/move; permission errors; metadata-only search. |
+| `npm run lint` | clean |
+| `npm run verify:media -- --builtin` | **Live, FFmpeg disabled:** Audius licensed track → built-in decoder → 50 Opus packets, rms 0.218, stream closed after stop. Archive MP3 stream decoded. |
+| `npm run verify:media` | Same checks with FFmpeg 6.1.1: pass |
+| Memory (measured, before Discord login) | KNIGHT ≈ 78 MB + AEGIS ≈ 102 MB as separate processes, ≈ 103 MB both in `npm run start:single`. Each built-in music stream adds ≈ 20–35 MB. |
+| Real audio in a Discord voice channel | **Not verified.** Needs a live `/play` on the deployed bot. |
+
+---
+
+## Earlier: production-readiness upgrade (2026-10-13/14)
 
 ## Evidence from this environment
 

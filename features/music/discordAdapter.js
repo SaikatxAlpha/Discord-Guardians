@@ -1,58 +1,61 @@
-// Real @discordjs/voice adapter for GuildMusic. Audio is streamed by ffmpeg
-// straight from the provider into the voice connection — never written to
-// disk. A global cap bounds concurrent ffmpeg processes across all servers.
-import prism from 'prism-media';
-import { createAudioPlayer, createAudioResource, NoSubscriberBehavior, StreamType } from '@discordjs/voice';
+// Real @discordjs/voice adapter for GuildMusic. Audio is streamed from the
+// provider into the voice connection — never written to disk. The audio
+// engine is FFmpeg when available, otherwise the built-in MP3/Opus decoder
+// (see audioEngine.js). A global cap bounds concurrent streams across servers.
+import { PermissionFlagsBits } from 'discord.js';
+import { createAudioPlayer, createAudioResource, NoSubscriberBehavior } from '@discordjs/voice';
 import { streamInput, MusicError } from './providers.js';
+import { createPlayableStream } from './audioEngine.js';
 
-const active = new Set(); // live ffmpeg wrappers (all guilds)
+const active = new Set(); // live audio streams (all guilds)
 
 export function activeStreams() {
   return active.size;
 }
 
-export function ffmpegStream(input, { remote }) {
-  const args = [
-    ...(remote ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_on_network_error', '1', '-reconnect_delay_max', '5', '-rw_timeout', '15000000', '-user_agent', 'SoulSocietyGuardians/1.0'] : []),
-    '-i', input,
-    '-analyzeduration', '0',
-    '-loglevel', '0',
-    '-vn',
-    '-f', 's16le',
-    '-ar', '48000',
-    '-ac', '2',
-  ];
-  return new prism.FFmpeg({ args });
-}
-
-/** Kill every ffmpeg process (shutdown safety net). */
+/** Destroy every audio stream (shutdown safety net). */
 export function killAllStreams() {
-  for (const ff of active) ff.destroy();
+  for (const s of active) s.destroy();
   active.clear();
 }
 
-export function createMusicAdapter({ guild, hub, maxStreams = 8, onMusicActive = () => {} }) {
+/** Can AEGIS join and speak in this voice channel? Returns a user-facing reason if not. */
+export function voicePermissionProblem(channel, me) {
+  if (!channel) return 'That voice channel no longer exists.';
+  const perms = channel.permissionsFor?.(me);
+  if (!perms?.has(PermissionFlagsBits.ViewChannel) || !perms.has(PermissionFlagsBits.Connect)) return `I don't have permission to **connect** to <#${channel.id}>.`;
+  if (!perms.has(PermissionFlagsBits.Speak)) return `I can join <#${channel.id}> but I don't have permission to **speak** there.`;
+  if (channel.full && !perms.has(PermissionFlagsBits.MoveMembers) && !channel.members?.has?.(me.id)) return `<#${channel.id}> is full.`;
+  return null;
+}
+
+export function createMusicAdapter({ guild, hub, maxStreams = 8, logger, onMusicActive = () => {} }) {
   return {
     connect: (channelId) => hub.connect(guild, channelId),
-    createPlayer: () => createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } }),
+    createPlayer: () => createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause, maxMissedFrames: 250 } }),
     async createResource(track) {
       if (active.size >= maxStreams) throw new MusicError('busy', 'Too many servers are streaming music right now; try again shortly.');
       const input = await streamInput(track);
-      const ff = ffmpegStream(input, { remote: /^https?:\/\//.test(input) });
-      active.add(ff);
-      const release = () => active.delete(ff);
-      ff.once('close', release);
-      ff.once('error', release);
-      return createAudioResource(ff, { inputType: StreamType.Raw, inlineVolume: true, metadata: track });
+      const { stream, inputType, engine, format } = await createPlayableStream(input);
+      active.add(stream);
+      const release = () => active.delete(stream);
+      stream.once('close', release);
+      stream.once('error', (err) => {
+        release();
+        logger?.warn('audio stream error', { guildId: guild.id, provider: track.provider, engine, err: err.message });
+      });
+      logger?.info('audio stream opened', { guildId: guild.id, provider: track.provider, engine, format });
+      return createAudioResource(stream, { inputType, inlineVolume: true, metadata: { ...track, engine } });
     },
     waitReconnect: (conn) => hub.waitReconnect(conn),
     subscribe: (conn, player) => {
       conn.subscribe(player);
       onMusicActive(true);
     },
-    disconnect: () => {
+    disconnect: (_conn, { force = false } = {}) => {
       onMusicActive(false);
-      hub.release(guild.id);
+      if (force) hub.leave(guild.id);
+      else hub.release(guild.id);
     },
   };
 }

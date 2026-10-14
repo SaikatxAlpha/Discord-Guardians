@@ -117,6 +117,8 @@ export function getConfig(env = process.env) {
       providers: list(env.MUSIC_PROVIDERS || 'audius,jamendo,archive,radio,local').map((p) => p.toLowerCase()),
       audiusAppName: env.AUDIUS_APP_NAME || 'SoulSocietyGuardians',
       jamendoClientId: env.JAMENDO_CLIENT_ID || '',
+      // Show Apple Music catalogue matches as metadata-only search results (never played).
+      metadataCatalog: bool(env.MUSIC_METADATA_CATALOG, true),
       youtubeApiKey: env.YOUTUBE_API_KEY || '',
       localDir: env.MUSIC_DIR ? path.resolve(ROOT, env.MUSIC_DIR) : path.join(dataDir, 'music'),
       enableArchive: bool(env.MUSIC_ENABLE_ARCHIVE, true),

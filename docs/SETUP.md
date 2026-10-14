@@ -3,7 +3,7 @@
 ## 1. Requirements
 
 - Windows 10/11, **Node.js 22.13+** (this PC has v22.21.0). SQLite is built into Node, so no database server is needed.
-- About 160 MB for `node_modules`. This includes ffmpeg (about 80 MB, used for music, spoken replies and MP4 welcome cards). No AI models are downloaded.
+- About 160 MB for `node_modules`. This includes ffmpeg-static (about 80 MB, optional: used for MP4 welcome cards, Windows spoken replies and non-MP3/Opus music). Music works without it through the built-in WebAssembly MP3/Opus decoder. No AI models are downloaded.
 
 ```powershell
 cd "D:\VOID BOT"
@@ -62,6 +62,18 @@ npm run register
 ## 4. Original welcome background
 
 Copy your original Soul Society artwork to `assets\welcome\background.png`. Preview it with `npm run render:welcome` or `/welcome-test`. See [assets/welcome/README.md](../assets/welcome/README.md).
+
+### Welcome message on the card
+
+`/setup welcome message:` is drawn **inside** the card, in a panel under the tagline. Real joins and `/welcome-test` use exactly the same card.
+
+- **Placeholders:** `{mention}` (shown as @name on the card; it also pings the member in the post), `{name}`, `{username}`, `{server}`, `{count}`.
+- **Line breaks:** type `\n`, because slash-command options can't contain real new lines.
+- **Formatting:** `**bold**`, `*italic*`, `__underline__`, `~~strike~~`, `` `code` ``, `# heading`, `> quote`, `- bullet`, emoji and custom server emoji.
+
+Example: `# Welcome, {mention}!\nYou are soul **#{count}** of {server} 💜\n- Read #rules\n- Grab your roles`
+
+Long messages shrink (32 → 18 px) and wrap, up to 6 lines. Text beyond that is shortened with "…", and `/welcome-test` warns you when that happens.
 
 ## 5. First run and server configuration
 

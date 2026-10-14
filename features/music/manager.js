@@ -6,6 +6,8 @@ import { EventEmitter } from 'node:events';
 import { MusicQueue, Mutex } from './queue.js';
 
 const MAX_CONSECUTIVE_FAILURES = 3;
+export const MAX_VOLUME = 100;
+const START_TIMEOUT_MS = 20000;
 export const LOOP_MODES = ['off', 'track', 'queue'];
 
 export class GuildMusic extends EventEmitter {
@@ -13,9 +15,11 @@ export class GuildMusic extends EventEmitter {
    * @param {object} o
    * @param {{connect:(channelId:string)=>Promise<any>, createPlayer:()=>any, createResource:(track:object)=>Promise<any>, waitReconnect:(conn:any)=>Promise<boolean>, subscribe:(conn:any, player:any)=>void, disconnect:(conn:any)=>void}} o.adapter
    */
-  constructor({ guildId, db, adapter, logger, idleLeaveMs = 300000, maxQueue = 100, defaultVolume = 70 }) {
+  constructor({ guildId, db, adapter, logger, idleLeaveMs = 300000, maxQueue = 100, defaultVolume = 70, startTimeoutMs = START_TIMEOUT_MS }) {
     super();
-    Object.assign(this, { guildId, db, adapter, logger, idleLeaveMs, maxQueue });
+    Object.assign(this, { guildId, db, adapter, logger, idleLeaveMs, maxQueue, startTimeoutMs });
+    this.starting = false; // a track is being started; its outcome is handled by playNext
+    this.startErrors = [];
     this.queue = new MusicQueue([], { max: maxQueue });
     this.lock = new Mutex();
     this.player = null;
@@ -26,7 +30,7 @@ export class GuildMusic extends EventEmitter {
     this.failures = 0;
     this.lastError = null;
     this.idleTimer = null;
-    this.volume = defaultVolume;
+    this.volume = Math.min(MAX_VOLUME, defaultVolume);
     this.loop = 'off';
     this.stopping = false;
     this.restore();
@@ -51,7 +55,7 @@ export class GuildMusic extends EventEmitter {
       this.queue = new MusicQueue(np && !np.live ? [np, ...tracks] : tracks, { max: this.maxQueue });
       this.textChannelId = row.text_channel_id;
       const s = JSON.parse(row.settings ?? '{}');
-      if (Number.isFinite(s.volume)) this.volume = s.volume;
+      if (Number.isFinite(s.volume)) this.volume = Math.min(MAX_VOLUME, s.volume);
       if (LOOP_MODES.includes(s.loop)) this.loop = s.loop;
     } catch {
       /* corrupt state is ignored */
@@ -78,6 +82,10 @@ export class GuildMusic extends EventEmitter {
     const p = this.adapter.createPlayer();
     p.on('stateChange', (oldS, newS) => {
       if (newS.status === 'idle' && oldS.status !== 'idle') {
+        // While a track is starting, playNext decides what happens next.
+        if (this.starting) return;
+        // Ignore the end of a resource that is no longer the current one.
+        if (oldS.resource && this.resource && oldS.resource !== this.resource) return;
         if (this.lastError) this.failures++;
         else this.failures = 0;
         const failed = Boolean(this.lastError);
@@ -89,7 +97,7 @@ export class GuildMusic extends EventEmitter {
     p.on('error', (err) => {
       this.lastError = err;
       this.logger?.warn('playback error', { guildId: this.guildId, err: err.message, provider: this.queue.current?.provider });
-      this.emit('trackError', this.queue.current, err);
+      if (!this.starting) this.emit('trackError', this.queue.current, err);
     });
     this.player = p;
     return p;
@@ -118,7 +126,7 @@ export class GuildMusic extends EventEmitter {
 
   /** Add one track; starts playback if nothing is playing. */
   enqueue(track, { voiceChannelId, textChannelId }) {
-    return this.enqueueMany([track], { voiceChannelId, textChannelId }).then((r) => ({ position: r.started ? 0 : r.firstPosition, started: r.started }));
+    return this.enqueueMany([track], { voiceChannelId, textChannelId }).then((r) => ({ position: r.started ? 0 : r.firstPosition, started: r.started, errors: r.errors, playing: r.playing }));
   }
 
   /** Add several tracks (playlist); returns how many were added. */
@@ -132,9 +140,16 @@ export class GuildMusic extends EventEmitter {
       const firstPosition = this.queue.length + 1;
       const added = this.queue.addMany(tracks);
       let started = null;
-      if (!this.queue.current || this.status === 'idle') started = await this.playNext();
+      this.startErrors = [];
+      this.inRequest = true;
+      try {
+        if (!this.queue.current || this.status === 'idle') started = await this.playNext();
+      } finally {
+        this.inRequest = false;
+      }
       this.persist();
-      return { added, skipped: tracks.length - added, started, firstPosition };
+      // started is only set once audio is actually flowing (player state "playing").
+      return { added, skipped: tracks.length - added, started, firstPosition, errors: [...this.startErrors], playing: this.queue.current };
     });
   }
 
@@ -167,19 +182,54 @@ export class GuildMusic extends EventEmitter {
         this.scheduleIdleLeave();
         return null;
       }
+      this.starting = true;
       try {
         const resource = await this.adapter.createResource(track);
         resource.volume?.setVolume?.(this.volume / 100);
         this.resource = resource;
-        this.ensurePlayer().play(resource);
-        this.emit('trackStart', track);
+        await this.startAndWait(resource);
+        this.starting = false;
+        // failures resets only when a track finishes cleanly (idle handler), so
+        // streams that start and then keep dying still halt the queue.
+        this.lastError = null;
+        this.emit('trackStart', track, { viaRequest: Boolean(this.inRequest) });
         return track;
       } catch (err) {
+        if (this.player && this.player.state?.status !== 'idle') this.player.stop(true);
+        this.starting = false;
+        this.resource = null;
+        this.lastError = null;
         this.failures++;
-        this.logger?.warn('could not start track; skipping', { provider: track.provider, code: err.code, err: err.message });
+        this.startErrors.push({ track, error: err });
+        this.logger?.warn('could not start track; skipping', { guildId: this.guildId, provider: track.provider, code: err.code ?? null, err: err.message });
         this.emit('trackError', track, err);
       }
     }
+  }
+
+  /** Play a resource and resolve only when audio is actually flowing. */
+  startAndWait(resource) {
+    const p = this.ensurePlayer();
+    return new Promise((resolve, reject) => {
+      const done = (err) => {
+        clearTimeout(timer);
+        p.off('stateChange', onState);
+        p.off('error', onError);
+        if (err) reject(err);
+        else resolve();
+      };
+      const onState = (_o, n) => {
+        if (n.status === 'playing') done();
+        else if (n.status === 'idle') done(this.lastError ?? new Error('The stream ended before any audio played.'));
+      };
+      const onError = (e) => done(e);
+      // Not unref'd: a pending start must always settle (the timer is cleared in done()).
+      const timer = setTimeout(() => done(new Error(`No audio arrived within ${Math.round(this.startTimeoutMs / 1000)} s.`)), this.startTimeoutMs);
+      p.on('stateChange', onState);
+      p.on('error', onError);
+      p.play(resource);
+      if (p.state?.status === 'playing') done();
+    });
   }
 
   skip() {
@@ -198,7 +248,7 @@ export class GuildMusic extends EventEmitter {
   }
 
   setVolume(percent) {
-    if (!Number.isFinite(percent) || percent < 0 || percent > 150) throw new Error('Volume must be between 0 and 150.');
+    if (!Number.isFinite(percent) || percent < 0 || percent > MAX_VOLUME) throw new Error(`Volume must be between 0 and ${MAX_VOLUME}.`);
     this.volume = Math.round(percent);
     this.resource?.volume?.setVolume?.(this.volume / 100);
     this.persist();
@@ -220,13 +270,52 @@ export class GuildMusic extends EventEmitter {
     });
   }
 
+  /** Stop playback and clear the queue; stay connected until the idle timeout. */
   stop() {
     return this.lock.run(async () => {
       this.stopping = true;
       this.queue.clear();
       this.persist();
       this.player?.stop(true);
-      this.teardown({ keepQueue: false });
+      this.scheduleIdleLeave();
+    });
+  }
+
+  /** Stop, clear and disconnect from voice now. */
+  leave() {
+    return this.lock.run(async () => {
+      const wasConnected = Boolean(this.connection);
+      this.stopping = true;
+      this.queue.clear();
+      this.player?.stop(true);
+      this.teardown({ keepQueue: false, force: true });
+      return wasConnected;
+    });
+  }
+
+  /** Remove all upcoming tracks; the current one keeps playing. */
+  clearQueue() {
+    return this.lock.run(async () => {
+      const n = this.queue.length;
+      this.queue.tracks = [];
+      this.persist();
+      return n;
+    });
+  }
+
+  removeAt(position) {
+    return this.lock.run(async () => {
+      const t = this.queue.remove(position);
+      this.persist();
+      return t;
+    });
+  }
+
+  moveTrack(from, to) {
+    return this.lock.run(async () => {
+      const t = this.queue.move(from, to);
+      this.persist();
+      return t;
     });
   }
 
@@ -238,7 +327,7 @@ export class GuildMusic extends EventEmitter {
     this.idleTimer.unref?.();
   }
 
-  teardown({ keepQueue }) {
+  teardown({ keepQueue, force = false }) {
     clearTimeout(this.idleTimer);
     if (!keepQueue) this.queue.clear();
     else if (this.queue.current && !this.queue.current.live) this.queue.tracks.unshift(this.queue.current);
@@ -246,7 +335,7 @@ export class GuildMusic extends EventEmitter {
     this.resource = null;
     if (this.connection) {
       try {
-        this.adapter.disconnect(this.connection);
+        this.adapter.disconnect(this.connection, { force });
       } catch {
         /* already gone */
       }

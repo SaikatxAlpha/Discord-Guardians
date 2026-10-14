@@ -14,7 +14,9 @@ Logs are in `data\logs\knight.log` and `data\logs\aegis.log` (JSON lines, secret
 | `/listen start` refuses | No STT provider. Set `GROQ_API_KEY` (free) and restart. |
 | Voice: STT unavailable notice | Daily cap or Groq 429; it resumes automatically. Raise `STT_DAILY_LIMIT` carefully (Groq free: 2,000/day). |
 | Music: "… is not available from a licensed source" | Most mainstream label songs are not licensed for bots on any free source. Try another title, `/search`, an Audius/Jamendo link or playlist. YouTube/Spotify links are matched by title only. See [MUSIC.md](MUSIC.md). |
-| Music/TTS silent, ffmpeg errors | `npm run check:config` shows the ffmpeg path. Reinstall with `npm ci` (ffmpeg-static is an optional dependency). |
+| Music silent or "needs FFmpeg" | `npm run check:config` shows the audio engine. Without FFmpeg only MP3 and Opus sources play (Audius, Jamendo, most Archive items); others are refused with a clear message. Set `FFMPEG_PATH` to a static ffmpeg binary to play everything. `npm run verify:media -- --builtin` tests the no-FFmpeg path live. |
+| "I don't have permission to connect/speak" | Give AEGIS **View Channel**, **Connect** and **Speak** in that voice channel (or its category). |
+| Bot restarts / out of memory on a 256 MB host | Start with `npm run start:single` (both bots in one process, ≈ 110 MB less) and set `MUSIC_MAX_STREAMS=2`. |
 | Welcome card shows the built-in design | Upload a background per server with `/setup welcome background:`, or set `WELCOME_BACKGROUND` (or `assets/welcome/background.png`) as the default for all servers. |
 | Welcome GIF/MP4 not sent | Falls back to PNG automatically if rendering fails or exceeds 9.5 MB; check the AEGIS log. |
 | Scheduled report didn't post | `/schedule list` shows failures; the reports channel must be set (`/setup channel purpose:reports`). Failed jobs retry with backoff and post a failure notice to the alpha channel. |

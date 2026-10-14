@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { GuardianBot } from '../shared/botBase.js';
 import { spokenSummary } from '../shared/render.js';
 import { aegisHandlers, aegisJobs } from './handlers.js';
-import { takePick, enqueueTrack } from './music.js';
+import { takePick, enqueueTrack, targetVoiceChannel } from './music.js';
 import { aegisCommands, onEventJoinButton } from './commands.js';
 import { syncReportJobs } from './reports.js';
 import { VoiceHub } from '../../features/voice/hub.js';
@@ -15,6 +15,7 @@ import { AlphaListener } from '../../features/voice/listener.js';
 import { synthesize, ttsAvailable } from '../../features/voice/tts.js';
 import { MusicManager } from '../../features/music/manager.js';
 import { createMusicAdapter, killAllStreams } from '../../features/music/discordAdapter.js';
+import { detectFfmpeg, engineDescription } from '../../features/music/audioEngine.js';
 import { describeTrack } from '../../features/music/providers.js';
 import { onMemberJoin, onMemberLeave } from '../../features/welcome/handler.js';
 import { recordMessageActivity } from '../../features/intelligence/analytics.js';
@@ -46,7 +47,7 @@ export function createAegis() {
     idleLeaveMs: config.music.idleLeaveMs,
     maxQueue: config.music.maxQueue,
     defaultVolume: config.music.defaultVolume,
-    adapterFor: (guild) => createMusicAdapter({ guild, hub, maxStreams: config.music.maxStreams }),
+    adapterFor: (guild) => createMusicAdapter({ guild, hub, maxStreams: config.music.maxStreams, logger }),
   });
 
   // ---------------------------------------------------------------- spoken responses
@@ -150,9 +151,13 @@ export function createAegis() {
     const p = takePick(i.customId.split(':')[2], i.user.id);
     if (p.error) return i.reply({ content: p.error, flags: MessageFlags.Ephemeral });
     const track = p.results[Number(i.values[0])];
-    await i.deferUpdate();
     const guild = await app.getGuild(p.guildId);
-    const r = await enqueueTrack({ music, guild, request: { userId: i.user.id } }, track, p.voiceChannelId, p.textChannelId).catch((err) => ({ ok: false, message: err.message }));
+    const ctx = { music, listener, guild, request: { userId: i.user.id, source: 'slash' } };
+    // Re-check at pick time: the user may have moved channels since searching.
+    const target = await targetVoiceChannel(ctx);
+    if (target.error) return i.reply({ content: target.error, flags: MessageFlags.Ephemeral });
+    await i.deferUpdate();
+    const r = await enqueueTrack(ctx, track, target.channelId, p.textChannelId ?? i.channelId).catch((err) => ({ ok: false, message: `Couldn't play that track: ${err.message}` }));
     await i.editReply({ content: r.message, components: [], embeds: [] });
   });
 
@@ -166,7 +171,7 @@ export function createAegis() {
     gm.on('trackError', (track, err) => post(`⚠️ Could not play **${safeText(track?.title ?? 'track', 100)}** (${safeText(err.message, 150)}). Skipping.`, true));
     gm.on('halted', () => post('⛔ Several tracks failed in a row; playback stopped.', true));
     gm.on('disconnected', () => post('🔌 Lost the voice connection. The queue was saved — use /play to continue.', true));
-    gm.on('trackStart', (t) => post(`🎶 Now playing **${safeText(describeTrack(t), 150)}**`));
+    gm.on('trackStart', (t, info) => !info?.viaRequest && post(`🎶 Now playing **${safeText(describeTrack(t), 150)}**`));
   });
 
   // ---------------------------------------------------------------- level rewards
@@ -234,6 +239,7 @@ export function createAegis() {
   app.timers.push(voiceTick);
 
   app.onReady = async (c) => {
+    logger.info('music audio engine', { engine: engineDescription(detectFfmpeg()) });
     for (const guild of c.guilds.cache.values()) {
       seedShop(db, guild.id);
       syncReportJobs(app, guild.id);

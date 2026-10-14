@@ -24,10 +24,10 @@ npm start                               # runs KNIGHT + AEGIS (Ctrl+C = clean sh
 Other commands:
 
 ```powershell
-npm test                 # 119 automated tests (Discord-independent)
+npm test                 # 137 automated tests (Discord-independent)
 npm run check:production -- --live   # production readiness (tokens, intents, Groq, Audius, storage)
 npm run smoke:login      # log both bots in with the current code, then disconnect (acts on nothing)
-npm run verify:media     # live Audius/Archive stream decode, ffmpeg cleanup, Opus
+npm run verify:media     # live Audius/Archive stream → Opus packets (add -- --builtin to test without FFmpeg)
 npm run benchmark:stt -- --heldout   # live Groq accuracy benchmark (uses your free quota)
 npm run lint             # ESLint static checks
 npm run simulate         # end-to-end ALPHA demo on a MOCK guild (no Discord needed)
@@ -35,6 +35,7 @@ npm run render:welcome   # render sample welcome cards to data\samples\
 npm run health           # health of both bots, queue, jobs, AI/STT usage
 npm run backup           # consistent SQLite backup to data\backups\
 npm start -- knight      # run only one guardian
+npm run start:single     # both guardians in ONE process (small hosts, ~110 MB less RAM)
 ```
 
 Before the first live run, see [docs/SETUP.md](docs/SETUP.md) for creating the two Discord applications.

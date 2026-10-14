@@ -12,10 +12,11 @@ import {
 } from '../../features/progression/economy.js';
 import { renderRankCard } from '../../features/progression/rankCard.js';
 import { fetchAvatar } from '../../features/welcome/renderer.js';
-import { buildWelcomeCard, saveGuildBackground, removeGuildBackground, displayNameOf } from '../../features/welcome/handler.js';
+import { composeWelcome, saveGuildBackground, removeGuildBackground, displayNameOf } from '../../features/welcome/handler.js';
 import { joinEvent } from '../../features/events/events.js';
 import { checkRoleManageable } from '../../core/discord/safety.js';
 import { syncReportJobs } from './reports.js';
+import { renderResponse } from '../shared/render.js';
 import { configCommands } from './configCommands.js';
 
 const P = PermissionFlagsBits;
@@ -31,6 +32,23 @@ function alphaAllowed(i, app) {
   return canUseAlpha(i.user.id, app.config, { member: i.member, guild: i.guild, settings: getGuildSettings(app.db, i.guildId) });
 }
 const ALPHA_DENIED = "ALPHA only accepts instructions from this server's owner or the users/roles trusted with /setup trusted.";
+
+/**
+ * Run a music action with Jockie-style replies: successes are posted
+ * publicly as plain messages, failures are shown only to the requester.
+ */
+async function musicRun(i, app, action, params) {
+  await i.deferReply();
+  const res = await app.coordinator.handleSteps(app.requestFrom(i), [{ action, params }]);
+  const r = res.results?.[0];
+  if (res.status === 'executed' && r) {
+    return i.editReply({ content: r.message ?? null, embeds: r.embed ? [r.embed] : [], components: r.components ?? [], allowedMentions: { parse: [] } });
+  }
+  if (res.status === 'awaiting_approval') return app.replyWithResponse(i, res);
+  const payload = r?.message ? { content: `⚠️ ${r.message}`, embeds: [] } : renderResponse('aegis', res);
+  await i.deleteReply().catch(() => null);
+  return i.followUp({ ...payload, components: [], flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+}
 
 function whenFrom(text, app) {
   return parseWhen(text.startsWith('in ') || text.startsWith('at ') || /^(tomorrow|tonight|every|daily|on |next )/i.test(text) ? text : `at ${text}`, Date.now(), app.config.timezone);
@@ -91,53 +109,45 @@ export function aegisCommands({ listener, music }) {
       execute: (i, app) => app.runSteps(i, [{ action: 'system.status', params: {} }], { ephemeral: true }),
     },
 
-    // ---------------------------------------------------------------- music
+    // ---------------------------------------------------------------- music (Jockie-style)
     {
-      data: new SlashCommandBuilder().setName('play').setDescription('Play music (Audius, Jamendo, Internet Archive) by name, link or playlist')
-        .addStringOption((o) => o.setName('query').setDescription('Song / artist, an Audius/Jamendo/Archive link or playlist, or a YouTube/Spotify link to match').setRequired(true).setMaxLength(300)),
-      execute: (i, app) => app.runSteps(i, [{ action: 'music.play', params: { query: i.options.getString('query') } }]),
+      data: new SlashCommandBuilder().setName('play').setDescription('Play a song by name, link or playlist in your voice channel')
+        .addStringOption((o) => o.setName('query').setDescription('Song / artist, an Audius/Jamendo/Archive link or playlist, or a direct audio URL').setRequired(true).setMaxLength(300)),
+      execute: (i, app) => musicRun(i, app, 'music.play', { query: i.options.getString('query') }),
     },
     {
-      data: new SlashCommandBuilder().setName('search').setDescription('Search licensed music and pick a result')
+      data: new SlashCommandBuilder().setName('search').setDescription('Search music: see playable and catalogue results, then pick one')
         .addStringOption((o) => o.setName('query').setDescription('Song or artist').setRequired(true).setMaxLength(200)),
-      execute: (i, app) => app.runSteps(i, [{ action: 'music.play', params: { query: i.options.getString('query'), pick: true } }]),
+      execute: (i, app) => musicRun(i, app, 'music.search', { query: i.options.getString('query') }),
     },
+    { data: new SlashCommandBuilder().setName('queue').setDescription('Show the current track and upcoming queue'), execute: (i, app) => musicRun(i, app, 'music.queue', {}) },
+    { data: new SlashCommandBuilder().setName('nowplaying').setDescription('Show the current track and its progress'), execute: (i, app) => musicRun(i, app, 'music.nowplaying', {}) },
+    { data: new SlashCommandBuilder().setName('skip').setDescription('Skip the current track'), execute: (i, app) => musicRun(i, app, 'music.skip', {}) },
+    { data: new SlashCommandBuilder().setName('pause').setDescription('Pause playback'), execute: (i, app) => musicRun(i, app, 'music.pause', {}) },
+    { data: new SlashCommandBuilder().setName('resume').setDescription('Resume playback'), execute: (i, app) => musicRun(i, app, 'music.resume', {}) },
+    { data: new SlashCommandBuilder().setName('stop').setDescription('Stop playback and clear the queue'), execute: (i, app) => musicRun(i, app, 'music.stop', {}) },
+    { data: new SlashCommandBuilder().setName('leave').setDescription('Disconnect AEGIS from voice'), execute: (i, app) => musicRun(i, app, 'music.leave', {}) },
     {
-      data: new SlashCommandBuilder().setName('volume').setDescription('Set playback volume').addIntegerOption((o) => o.setName('percent').setDescription('0–150').setRequired(true).setMinValue(0).setMaxValue(150)),
-      execute: (i, app) => app.runSteps(i, [{ action: 'music.volume', params: { percent: i.options.getInteger('percent') } }]),
+      data: new SlashCommandBuilder().setName('volume').setDescription('Set playback volume').addIntegerOption((o) => o.setName('percent').setDescription('0–100').setRequired(true).setMinValue(0).setMaxValue(100)),
+      execute: (i, app) => musicRun(i, app, 'music.volume', { percent: i.options.getInteger('percent') }),
     },
-    { data: new SlashCommandBuilder().setName('shuffle').setDescription('Shuffle the queue'), execute: (i, app) => app.runSteps(i, [{ action: 'music.shuffle', params: {} }]) },
     {
       data: new SlashCommandBuilder().setName('loop').setDescription('Loop the current track or the whole queue')
         .addStringOption((o) => o.setName('mode').setDescription('Mode').setRequired(true).addChoices({ name: 'off', value: 'off' }, { name: 'track', value: 'track' }, { name: 'queue', value: 'queue' })),
-      execute: (i, app) => app.runSteps(i, [{ action: 'music.loop', params: { mode: i.options.getString('mode') } }]),
+      execute: (i, app) => musicRun(i, app, 'music.loop', { mode: i.options.getString('mode') }),
     },
-    { data: new SlashCommandBuilder().setName('skip').setDescription('Skip the current track'), execute: (i, app) => app.runSteps(i, [{ action: 'music.skip', params: {} }]) },
-    { data: new SlashCommandBuilder().setName('pause').setDescription('Pause playback'), execute: (i, app) => app.runSteps(i, [{ action: 'music.pause', params: {} }]) },
-    { data: new SlashCommandBuilder().setName('resume').setDescription('Resume playback'), execute: (i, app) => app.runSteps(i, [{ action: 'music.resume', params: {} }]) },
-    { data: new SlashCommandBuilder().setName('stop').setDescription('Stop music and clear the queue'), execute: (i, app) => app.runSteps(i, [{ action: 'music.stop', params: {} }]) },
-    { data: new SlashCommandBuilder().setName('nowplaying').setDescription('Show the current track'), execute: (i, app) => app.runSteps(i, [{ action: 'music.nowplaying', params: {} }]) },
     {
-      data: new SlashCommandBuilder().setName('queue').setDescription('Show or edit the music queue')
-        .addSubcommand((s) => s.setName('show').setDescription('Show the queue'))
-        .addSubcommand((s) => s.setName('remove').setDescription('Remove a track').addIntegerOption((o) => o.setName('position').setDescription('Position').setRequired(true).setMinValue(1)))
-        .addSubcommand((s) => s.setName('move').setDescription('Move a track')
-          .addIntegerOption((o) => o.setName('from').setDescription('From').setRequired(true).setMinValue(1))
-          .addIntegerOption((o) => o.setName('to').setDescription('To').setRequired(true).setMinValue(1))),
-      async execute(i, app) {
-        const sub = i.options.getSubcommand();
-        if (sub === 'show') return app.runSteps(i, [{ action: 'music.queue', params: {} }]);
-        const gm = music.peek(i.guildId);
-        if (!gm) return i.reply({ content: 'No music session.', ...eph });
-        try {
-          const t = await gm.lock.run(async () => (sub === 'remove' ? gm.queue.remove(i.options.getInteger('position')) : gm.queue.move(i.options.getInteger('from'), i.options.getInteger('to'))));
-          gm.persist();
-          return i.reply({ content: `${sub === 'remove' ? 'Removed' : 'Moved'}: **${safeText(t.title, 100)}**` });
-        } catch (err) {
-          return i.reply({ content: err.message, ...eph });
-        }
-      },
+      data: new SlashCommandBuilder().setName('remove').setDescription('Remove a track from the queue').addIntegerOption((o) => o.setName('position').setDescription('Queue position (see /queue)').setRequired(true).setMinValue(1)),
+      execute: (i, app) => musicRun(i, app, 'music.remove', { position: i.options.getInteger('position') }),
     },
+    {
+      data: new SlashCommandBuilder().setName('move').setDescription('Move a track to another queue position')
+        .addIntegerOption((o) => o.setName('from').setDescription('Current position').setRequired(true).setMinValue(1))
+        .addIntegerOption((o) => o.setName('to').setDescription('New position').setRequired(true).setMinValue(1)),
+      execute: (i, app) => musicRun(i, app, 'music.move', { from: i.options.getInteger('from'), to: i.options.getInteger('to') }),
+    },
+    { data: new SlashCommandBuilder().setName('shuffle').setDescription('Shuffle the upcoming tracks'), execute: (i, app) => musicRun(i, app, 'music.shuffle', {}) },
+    { data: new SlashCommandBuilder().setName('clearqueue').setDescription('Remove all upcoming tracks (the current song keeps playing)'), execute: (i, app) => musicRun(i, app, 'music.clear', {}) },
 
     // ---------------------------------------------------------------- progression
     {
@@ -447,7 +457,7 @@ export function aegisCommands({ listener, music }) {
         .addSubcommand((s) => s.setName('welcome').setDescription('Welcome settings')
           .addBooleanOption((o) => o.setName('enabled').setDescription('Send welcome cards'))
           .addStringOption((o) => o.setName('format').setDescription('Card format').addChoices({ name: 'static PNG', value: 'png' }, { name: 'animated GIF', value: 'gif' }, { name: 'MP4 video', value: 'mp4' }))
-          .addStringOption((o) => o.setName('message').setDescription('Template: {mention} {name} {server} {count}').setMaxLength(500))
+          .addStringOption((o) => o.setName('message').setDescription('Drawn on the card. {mention} {name} {server} {count}, **bold**, emoji, \\n = new line').setMaxLength(500))
           .addStringOption((o) => o.setName('leave_message').setDescription('Template: {name} {server}').setMaxLength(500))
           .addStringOption((o) => o.setName('tagline').setDescription('Card tagline, e.g. HAS ENTERED SOUL SOCIETY').setMaxLength(40))
           .addAttachmentOption((o) => o.setName('background').setDescription('Custom card background (PNG/JPG/WebP, ≤ 8 MB, 1200×500 recommended)'))
@@ -586,11 +596,15 @@ export function aegisCommands({ listener, music }) {
         await i.deferReply();
         const user = i.options.getUser('member') ?? i.user;
         const member = await i.guild.members.fetch(user.id);
-        const card = await buildWelcomeCard(member, { config: app.config, settings: getGuildSettings(app.db, i.guildId), format: i.options.getString('format') ?? 'png', logger: app.logger });
-        return i.editReply({
-          content: card.usedOriginal ? '' : '⚠️ No background image configured — showing the built-in design. Upload one with `/setup welcome background:`.',
-          files: [new AttachmentBuilder(card.buffer, { name: `welcome.${card.format}` })],
-        });
+        const settings = getGuildSettings(app.db, i.guildId);
+        // Exactly the same composition as a real join (saved message, tagline, background).
+        const w = await composeWelcome(member, { config: app.config, settings, format: i.options.getString('format') ?? settings.welcome.format, logger: app.logger });
+        const notes = ['-# Preview of a real join post' + (w.content ? ' (the mention above pings only on real joins)' : '') + '.'];
+        if (!settings.welcome.enabled) notes.push('-# ⚠️ Welcome messages are currently **disabled** — enable with `/setup welcome enabled:true`.');
+        if (w.card && !w.card.usedOriginal) notes.push('-# ⚠️ No background image configured — showing the built-in design. Upload one with `/setup welcome background:`.');
+        if (w.card?.message?.truncated) notes.push('-# ⚠️ The welcome message was too long for the card and was shortened.');
+        if (!w.card) notes.push('-# ⚠️ The card could not be rendered, so the message is shown as text.');
+        return i.editReply({ content: [w.content, ...notes].filter(Boolean).join('\n'), files: w.files, allowedMentions: { parse: [] } });
       },
     },
     ...configCommands({ listener, music }),

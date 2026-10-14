@@ -249,9 +249,29 @@ export const ACTIONS = {
   'music.queue': { bot: 'aegis', minAuth: AUTH.MEMBER, retryable: true, params: {}, risk: () => RISK.LOW, describe: () => 'Show queue' },
   'music.volume': {
     bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false,
-    params: { percent: { type: 'integer', min: 0, max: 150 }, change: { type: 'integer', min: -100, max: 100 } },
+    params: { percent: { type: 'integer', min: 0, max: 100 }, change: { type: 'integer', min: -100, max: 100 } },
     risk: () => RISK.LOW,
     describe: (p) => (p.percent != null ? `Set volume to ${p.percent}%` : `Change volume by ${p.change}%`),
+  },
+  'music.search': {
+    bot: 'aegis', minAuth: AUTH.MEMBER, retryable: true,
+    params: { query: { type: 'string', required: true, maxLength: 200, minLength: 2 } },
+    risk: () => RISK.LOW,
+    describe: (p) => `Search music for "${p.query}"`,
+  },
+  'music.leave': { bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false, params: {}, risk: () => RISK.LOW, describe: () => 'Stop music and leave the voice channel' },
+  'music.clear': { bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false, params: {}, risk: () => RISK.LOW, describe: () => 'Clear upcoming tracks' },
+  'music.remove': {
+    bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false,
+    params: { position: { type: 'integer', required: true, min: 1, max: 1000 } },
+    risk: () => RISK.LOW,
+    describe: (p) => `Remove track #${p.position} from the queue`,
+  },
+  'music.move': {
+    bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false,
+    params: { from: { type: 'integer', required: true, min: 1, max: 1000 }, to: { type: 'integer', required: true, min: 1, max: 1000 } },
+    risk: () => RISK.LOW,
+    describe: (p) => `Move track #${p.from} to #${p.to}`,
   },
   'music.shuffle': { bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false, params: {}, risk: () => RISK.LOW, describe: () => 'Shuffle the queue' },
   'music.loop': {

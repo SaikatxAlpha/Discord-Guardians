@@ -10,7 +10,7 @@ import { execFileSync } from 'node:child_process';
 import { loadEnv, getConfig, validateConfig, ROOT } from '../config/env.js';
 import { openDatabase } from '../database/db.js';
 import { MIGRATIONS } from '../database/migrations.js';
-import { ffmpegPath } from '../features/welcome/renderer.js';
+import { detectFfmpeg, engineDescription } from '../features/music/audioEngine.js';
 
 loadEnv();
 const cfg = getConfig();
@@ -30,12 +30,20 @@ if (cfg.operatorGlobalAccess) add('WARN', 'OPERATOR_GLOBAL_ACCESS', 'enabled: th
 // ---- runtime
 const [major, minor] = process.versions.node.split('.').map(Number);
 add(major > 22 || (major === 22 && minor >= 13) ? 'PASS' : 'FAIL', 'Node.js', `v${process.versions.node} (need ≥ 22.13 for built-in SQLite)`);
-const ff = ffmpegPath();
-add(ff ? 'PASS' : 'FAIL', 'ffmpeg', ff ? 'found' : 'missing — music and MP4 cards will not work');
-for (const f of ['Cinzel-Black.ttf', 'Rajdhani-Bold.ttf', 'NotoSansEgyptianHieroglyphs-Regular.ttf', 'NotoSansMath-Regular.ttf']) {
+const ff = detectFfmpeg();
+add(ff.available ? 'PASS' : 'WARN', 'audio engine', ff.available
+  ? engineDescription(ff)
+  : 'FFmpeg not found — music uses the built-in decoder (MP3, Ogg/Opus, WebM/Opus play; AAC/FLAC/Vorbis sources are refused with a clear message). Animated MP4 welcome cards fall back to GIF/PNG. Optional: set FFMPEG_PATH to a static ffmpeg binary.');
+try {
+  await import('mpg123-decoder');
+  add('PASS', 'mp3 decoder', 'mpg123-decoder (WebAssembly) loaded');
+} catch (err) {
+  add(ff.available ? 'WARN' : 'FAIL', 'mp3 decoder', `mpg123-decoder failed to load (${err.message}) — run npm install`);
+}
+for (const f of ['Cinzel-Black.ttf', 'Rajdhani-Bold.ttf', 'NotoSansEgyptianHieroglyphs-Regular.ttf', 'NotoSansMath-Regular.ttf', 'NotoEmoji.ttf']) {
   if (!fs.existsSync(path.join(ROOT, 'assets', 'fonts', f))) add('WARN', 'fonts', `${f} missing`);
 }
-add('PASS', 'memory', `${Math.round(os.totalmem() / 1048576)} MB total, ${Math.round(os.freemem() / 1048576)} MB free (both bots need ≈ 300–600 MB)`);
+add('PASS', 'memory', `${Math.round(os.totalmem() / 1048576)} MB total, ${Math.round(os.freemem() / 1048576)} MB free (measured before login: KNIGHT ≈ 80 MB + AEGIS ≈ 100 MB as separate processes, ≈ 105 MB together with npm run start:single; each built-in-decoder music stream adds ≈ 20–35 MB)`);
 
 // ---- storage
 try {
