@@ -168,7 +168,8 @@ export function createAegis() {
         .fetch(gm.guildId)
         .then((g) => (always || getGuildSettings(db, g.id).music.announceTracks ? sendToChannel(g, gm.textChannelId, { content }, logger) : null))
         .catch(() => null);
-    gm.on('trackError', (track, err) => post(`⚠️ Could not play **${safeText(track?.title ?? 'track', 100)}** (${safeText(err.message, 150)}). Skipping.`, true));
+    // Errors while answering a /play are already in that reply; don't post them twice.
+    gm.on('trackError', (track, err, info) => !info?.viaRequest && post(`⚠️ Could not play **${safeText(track?.title ?? 'track', 100)}** (${safeText(err.message, 150)}). ${info?.fallback ? 'Trying another upload of the same song.' : 'Skipping.'}`, true));
     gm.on('halted', () => post('⛔ Several tracks failed in a row; playback stopped.', true));
     gm.on('disconnected', () => post('🔌 Lost the voice connection. The queue was saved — use /play to continue.', true));
     gm.on('trackStart', (t, info) => !info?.viaRequest && post(`🎶 Now playing **${safeText(describeTrack(t), 150)}**`));

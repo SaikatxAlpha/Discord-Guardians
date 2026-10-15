@@ -199,10 +199,15 @@ export class GuildMusic extends EventEmitter {
         this.starting = false;
         this.resource = null;
         this.lastError = null;
-        this.failures++;
+        // Same recording from another upload/provider: try it next before moving
+        // on. Only the final attempt counts as a failure, so one request can
+        // never halt everyone's queue.
+        const [alt, ...more] = track.alternates ?? [];
+        if (alt) this.queue.tracks.unshift({ ...alt, requestedBy: track.requestedBy, alternates: more, fallbackFor: track.title });
+        else this.failures++;
         this.startErrors.push({ track, error: err });
-        this.logger?.warn('could not start track; skipping', { guildId: this.guildId, provider: track.provider, code: err.code ?? null, err: err.message });
-        this.emit('trackError', track, err);
+        this.logger?.warn(alt ? 'could not start track; trying another upload' : 'could not start track; skipping', { guildId: this.guildId, provider: track.provider, code: err.code ?? null, err: err.message });
+        this.emit('trackError', track, err, { viaRequest: Boolean(this.inRequest), fallback: Boolean(alt) });
       }
     }
   }

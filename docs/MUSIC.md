@@ -4,8 +4,16 @@
 
 | Command | What it does |
 |---|---|
-| `/play <name \| link \| playlist>` | Joins **your** voice channel and plays, or queues if something is playing. Ambiguous searches show a pick menu. |
-| `/search <query>` | Shows ✅ playable results (title, artist, duration, source) and ℹ️ catalogue-only matches, with a pick menu. |
+| `/play <name \| link \| playlist>` | **One command:** searches with your exact words and plays the best match that is *the song you asked for* in **your** voice channel, or queues it ("Queued at #N"). Never asks you to choose or repeat. |
+| `/search <query>` | For browsing: ✅ playable results (title, artist, duration, source) and ℹ️ catalogue-only matches, with a pick menu. |
+
+### How `/play` picks a track
+
+- **Same recording only.** Every meaningful word of the query must match the title or artist. One-letter typos, "lo-fi"/"lofi" and filler words ("from", "by", "song") are tolerated. Most of the title must be what you asked for.
+- **No unrequested versions.** Covers, remixes, slowed/sped-up, live, karaoke and instrumental versions are only chosen if your query asks for them.
+- **Ranking.** Exact title first, then the artist the catalogue credits, then the provider and popularity.
+- **Automatic fallback.** If the best upload's stream fails, up to 2 other uploads of the same song are tried, and the reply says so. A different song is never substituted.
+- **Not available.** If no permitted source has the recording, you get one message, for example: "🚫 **Slow Motion (From "Bharat")** by Shreya Ghoshal & Nakash Aziz isn't available from any source AEGIS may legally stream, so nothing was played. Browse with `/search …`". It lists a few playable alternatives when there are any. Nothing is played.
 | `/queue` · `/nowplaying` | The queue, or the current track with a progress bar. |
 | `/skip` · `/pause` · `/resume` | Playback control. |
 | `/stop` | Stops and clears the queue. AEGIS stays in the channel until the idle timeout. |

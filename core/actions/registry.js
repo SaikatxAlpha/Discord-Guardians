@@ -238,7 +238,7 @@ export const ACTIONS = {
   },
   'music.play': {
     bot: 'aegis', minAuth: AUTH.MEMBER, retryable: false,
-    params: { query: { type: 'string', required: true, maxLength: 300 }, pick: { type: 'boolean', default: false } },
+    params: { query: { type: 'string', required: true, minLength: 1, maxLength: 300 } },
     risk: () => RISK.LOW,
     describe: (p) => `Play "${p.query}"`,
   },

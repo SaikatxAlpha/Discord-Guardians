@@ -81,6 +81,87 @@ export function matchScore(query, track) {
   return Math.min(100, Math.round(score));
 }
 
+// ------------------------------------------------------------------ "same recording" matching for /play
+
+// Words that carry no identity ("Slow Motion from Bharat", "Her by JVKE").
+const FILLER = new Set(['the', 'a', 'an', 'of', 'from', 'by', 'feat', 'ft', 'featuring', 'and', 'with', 'x', 'song', 'track', 'music', 'official', 'audio', 'video', 'lyrics', 'lyric', 'full', 'hd', 'movie', 'film']);
+// Versions that are a different recording unless the user asked for them.
+const DERIVATIVE = /\b(cover|covers|covered|remix|rmx|remixed|slowed|reverb|sped\s*up|nightcore|8d|karaoke|instrumental|mashup|bootleg|tribute|parody|type\s*beat|lo-?fi\s*(?:version|flip|remix)|acoustic|unplugged|live\s+(?:at|from|in|version|session))\b|([([](?:lo-?fi|live)[)\]])/i;
+const significant = (s) => normWords(s).filter((w) => !FILLER.has(w));
+
+function editDistanceAtMost1(a, b) {
+  if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0;
+  let j = 0;
+  let edits = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      i++;
+      j++;
+      continue;
+    }
+    if (++edits > 1) return false;
+    if (a.length > b.length) i++;
+    else if (b.length > a.length) j++;
+    else {
+      i++;
+      j++;
+    }
+  }
+  return edits + (a.length - i) + (b.length - j) <= 1;
+}
+
+/**
+ * How well a track is the recording the user asked for.
+ * - every meaningful query word must appear in the title/artist (typos of
+ *   one letter and joined spellings like "lofi"/"lo-fi" are tolerated);
+ * - most of the title (without bracketed parts) must be accounted for by the
+ *   query or the artist name, so "Slow Motion Dreams in Paris" ≠ "Slow Motion";
+ * - covers/remixes/slowed/live versions only match when the query asks for them.
+ * @returns {{suitable:boolean, coverage:number, titleCoverage:number, derivative:boolean}}
+ */
+export function matchQuality(query, track) {
+  const q = [...new Set(significant(query))];
+  if (!q.length) return { suitable: false, coverage: 0, titleCoverage: 0, derivative: false };
+  const title = String(track.title ?? '');
+  const artist = String(track.artist ?? '');
+  const list = normWords(`${title} ${artist}`);
+  const hay = new Set(list);
+  // Joined spellings at word boundaries only ("lo-fi" = "lofi"), never inside a word ("her" ≠ "Herdem").
+  for (let i = 0; i < list.length - 1; i++) {
+    hay.add(list[i] + list[i + 1]);
+    if (i < list.length - 2) hay.add(list[i] + list[i + 1] + list[i + 2]);
+  }
+  const found = (w) => hay.has(w) || (w.length >= 5 && [...hay].some((h) => h.length >= 4 && editDistanceAtMost1(w, h)));
+  const coverage = q.filter(found).length / q.length;
+  const core = significant(title.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').replace(/\b(?:feat|ft)\.?\s.*$/i, ' '));
+  const known = new Set([...q, ...normWords(artist)]);
+  const titleCoverage = core.length ? core.filter((w) => known.has(w) || [...known].some((k) => k.length >= 5 && editDistanceAtMost1(w, k))).length / core.length : 0;
+  const m = DERIVATIVE.exec(title);
+  const derivative = Boolean(m) && !normName(query).includes(normName((m[1] ?? m[2]).split(/\s+/)[0]));
+  return { suitable: coverage === 1 && titleCoverage >= 0.5 && !derivative, coverage, titleCoverage, derivative };
+}
+
+/**
+ * Split search results into tracks that are the requested recording (best
+ * first) and other playable results that are only alternatives.
+ */
+export function rankForPlay(query, results) {
+  const suitable = [];
+  const alternatives = [];
+  const qName = normName(significant(query).join(' '));
+  for (const t of results) {
+    const mq = matchQuality(query, t);
+    if (mq.suitable) {
+      const core = normName(significant(String(t.title).replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')).join(' '));
+      const exactTitle = core && (core === qName || qName.startsWith(core) || qName.endsWith(core));
+      suitable.push({ t, rank: (t.score ?? 0) + mq.titleCoverage * 20 + (exactTitle ? 15 : 0) });
+    } else if (mq.coverage >= 0.5) alternatives.push(t);
+  }
+  suitable.sort((a, b) => b.rank - a.rank);
+  return { suitable: suitable.map((s) => s.t), alternatives };
+}
+
 // ------------------------------------------------------------------ Audius
 
 const audiusTrack = (t, appName) => ({

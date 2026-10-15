@@ -195,3 +195,16 @@ test('AI fallback is used only when deterministic parsing fails, and still goes 
   assert.equal(r.status, 'awaiting_approval', 'AI cannot bypass confirmation');
   assert.ok(env.guild.channels.cache.find((c) => c.name === 'staff'));
 });
+
+test('/play executes in one step — no confirmation or clarification, even from an uncertain voice transcript', async () => {
+  const env = buildMockGuild();
+  const config = testConfig({ ownerId: env.guild.ownerId });
+  const calls = [];
+  const handlers = new Map([['music.play', async (_ctx, p) => (calls.push(p.query), { ok: true, message: `▶️ Now playing ${p.query}` })]]);
+  const coord = coordinatorFor({ db: memDb(), config, guild: env.guild, handlers });
+  const base = { guildId: env.guild.id, channelId: env.channels.general.id, userId: env.members.john.id };
+  const slash = await coord.handleSteps({ ...base, requestId: rid(), source: 'slash' }, [{ action: 'music.play', params: { query: 'Slow Motion From Bharat' } }]);
+  const voice = await coord.handleSteps({ ...base, requestId: rid(), userId: env.guild.ownerId, source: 'voice', forceConfirm: true }, [{ action: 'music.play', params: { query: 'Slow Motion From Bharat' } }]);
+  assert.deepEqual([slash.status, voice.status], ['executed', 'executed']);
+  assert.deepEqual(calls, ['Slow Motion From Bharat', 'Slow Motion From Bharat'], 'the exact query reaches the handler');
+});

@@ -5,10 +5,12 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { MusicQueue } from '../features/music/queue.js';
 import { GuildMusic, MusicManager } from '../features/music/manager.js';
-import { searchTracks, validateDirectUrl, searchLocal, resolveLink, parsePlaylistFile, matchScore, cleanVideoTitle, MusicError, describeTrack } from '../features/music/providers.js';
+import { matchQuality, rankForPlay, searchTracks, validateDirectUrl, searchLocal, resolveLink, parsePlaylistFile, matchScore, cleanVideoTitle, MusicError, describeTrack } from '../features/music/providers.js';
 import { memoryLogger } from '../core/logger.js';
 import { PermissionFlagsBits } from 'discord.js';
-import { enqueueTrack, targetVoiceChannel } from '../apps/aegis/music.js';
+import { enqueueTrack, targetVoiceChannel, musicHandlers } from '../apps/aegis/music.js';
+import { getAction } from '../core/actions/registry.js';
+import { validateParams } from '../core/actions/validate.js';
 import { memDb, tempDir, testConfig } from './helpers.js';
 
 /** MOCK voice layer: a player that emits the same state transitions as @discordjs/voice. */
@@ -440,4 +442,142 @@ test('ranking helpers', () => {
   assert.equal(matchScore('midnight drive', { title: 'Midnight Drive', artist: 'X' }), 100);
   assert.ok(matchScore('midnight drive', { title: 'Morning Walk', artist: 'X' }) < 20);
   assert.equal(describeTrack({ provider: 'audius', title: 'T', artist: 'A' }), 'T — A · Audius');
+});
+
+// ------------------------------------------------------------------ /play: one-command playback (MOCK HTTP + MOCK voice)
+
+const FOLLOW_UP = /what (?:do you )?want|choose|select|pick one|which one|repeat|try again with/i;
+
+/** A guild/voice context where the requester sits in a voice channel AEGIS may join. */
+function playCtx({ gm, fetchImpl, userId = 'u1' }) {
+  return {
+    guild: {
+      id: gm.guildId,
+      members: { fetch: async () => ({ voice: { channelId: 'vc1' } }), me: { id: 'bot' } },
+      channels: { cache: new Map([['vc1', { id: 'vc1', permissionsFor: () => ({ has: () => true }) }]]), fetch: async () => null },
+    },
+    request: { userId, channelId: 'tc', source: 'slash' },
+    music: { get: () => gm, peek: () => gm },
+    settings: { channels: { music: null }, music: {} },
+    config: cfg({ providers: ['audius'] }),
+    logger: memoryLogger(),
+    fetchImpl,
+  };
+}
+
+const audiusSearch = (tracks, itunes = []) =>
+  router([
+    [/api\.audius\.co\/v1\/tracks\/search/, { data: tracks }],
+    [/itunes\.apple\.com\/search/, { results: itunes }],
+  ]).fetchImpl;
+const itunesHit = (title, artist) => ({ trackId: 1, trackName: title, artistName: artist, trackTimeMillis: 200000, trackViewUrl: 'https://music.apple.com/x' });
+
+test('/play <query> searches and plays the best exact match at once — no picker, no follow-up question', async () => {
+  const gm = gmFor({ adapter: fakeAdapter() });
+  // Two near-identical scores used to trigger a "choose one" menu; /play must just play.
+  const fetchImpl = audiusSearch([
+    audiusTrackJson('a1', 'Midnight Drive (Remix)', 'Neon'),
+    audiusTrackJson('a2', 'Midnight Drive', 'Synth Owl'),
+    audiusTrackJson('a3', 'Midnight Drive', 'Synth Owl Live Band'),
+    audiusTrackJson('a4', 'Midnight Driver Anthem Extended Mega Mix', 'Other'),
+  ]);
+  const res = await musicHandlers['music.play'](playCtx({ gm, fetchImpl }), { query: 'Midnight Drive' });
+  assert.equal(res.ok, true);
+  assert.match(res.message, /^▶️ Now playing \*\*Midnight Drive — Synth Owl/);
+  assert.equal(res.components, undefined, 'no select menu');
+  assert.doesNotMatch(res.message, FOLLOW_UP);
+  assert.equal(gm.queue.current.id, 'a2');
+  assert.equal(gm.status, 'playing');
+});
+
+test('/play while something is playing queues the track and confirms its position', async () => {
+  const gm = gmFor({ adapter: fakeAdapter() });
+  const ctx = playCtx({ gm, fetchImpl: audiusSearch([audiusTrackJson('s1', 'Ocean Eyes', 'Bedroom Keys'), audiusTrackJson('s2', 'Paper Planes', 'Indie Kid')]) });
+  await musicHandlers['music.play'](ctx, { query: 'Ocean Eyes' });
+  const second = await musicHandlers['music.play'](ctx, { query: 'Paper Planes' });
+  const third = await musicHandlers['music.play'](ctx, { query: 'Ocean Eyes Bedroom Keys' });
+  assert.match(second.message, /^➕ Queued at #1: \*\*Paper Planes — Indie Kid/);
+  assert.match(third.message, /^➕ Queued at #2: \*\*Ocean Eyes — Bedroom Keys/);
+  assert.equal(gm.queue.current.title, 'Ocean Eyes', 'the playing track is untouched');
+  assert.deepEqual(gm.queue.tracks.map((x) => x.title), ['Paper Planes', 'Ocean Eyes']);
+});
+
+test('/play falls back to another upload of the same song when the best stream fails — never to a different song', async () => {
+  const gm = gmFor({ adapter: fakeAdapter({ failResource: new Set(['Golden Fields']) }) });
+  const fetchImpl = audiusSearch([
+    audiusTrackJson('g1', 'Golden Fields', 'Mira Vale', { play_count: 900000 }),
+    audiusTrackJson('x1', 'Silver Rivers', 'Mira Vale'),
+    audiusTrackJson('g2', 'Golden Fields (Official Audio)', 'Mira Vale'),
+  ]);
+  const res = await musicHandlers['music.play'](playCtx({ gm, fetchImpl }), { query: 'golden fields mira vale' });
+  assert.equal(res.ok, true);
+  assert.equal(gm.queue.current.id, 'g2', 'the second upload of the same recording plays');
+  assert.match(res.message, /^▶️ Now playing \*\*Golden Fields \(Official Audio\) — Mira Vale/);
+  assert.match(res.message, /another upload of the same song/);
+  assert.match(res.message, /Couldn't play \*\*Golden Fields — Mira Vale/);
+  assert.equal(gm.failures, 0, 'a successful fallback is not counted as a failure');
+});
+
+test('/play reports an unavailable recording once, plays nothing, and never substitutes another song (acceptance: Slow Motion From Bharat)', async () => {
+  const gm = gmFor({ adapter: fakeAdapter() });
+  const fetchImpl = audiusSearch(
+    [
+      audiusTrackJson('d1', 'Slow Motion', 'DJ Somebody'), // same words, different song
+      audiusTrackJson('d2', 'Slow Motion (From "Bharat") Cover', 'Bedroom Singer'), // a cover, not the recording
+      audiusTrackJson('d3', 'Motion Sickness', 'Band'),
+    ],
+    [itunesHit('Slow Motion (From "Bharat")', 'Shreya Ghoshal & Nakash Aziz')],
+  );
+  const res = await musicHandlers['music.play'](playCtx({ gm, fetchImpl }), { query: 'Slow Motion From Bharat' });
+  assert.equal(res.ok, false);
+  assert.match(res.message, /^🚫 \*\*Slow Motion \(From "Bharat"\)\*\* by Shreya Ghoshal & Nakash Aziz isn't available from any source AEGIS may legally stream/);
+  assert.match(res.message, /nothing was played/);
+  assert.match(res.message, /Playable alternatives: .*"Slow Motion"/, 'offered, not played');
+  assert.match(res.message, /Playable alternatives: .*"Slow Motion \(From "Bharat"\) Cover"/);
+  assert.doesNotMatch(res.message, /Motion Sickness/, 'unrelated results are not even suggested');
+  assert.match(res.message, /`\/search Slow Motion From Bharat`/);
+  assert.doesNotMatch(res.message, FOLLOW_UP);
+  assert.equal(res.message.split('\n').length, 1, 'one concise message');
+  assert.equal(gm.queue.current, null);
+  assert.equal(gm.connection, null, 'did not even join voice');
+
+  // The same recording, when a permitted source has it, plays directly.
+  const gm2 = gmFor({ guildId: 'g2', adapter: fakeAdapter() });
+  const ok = await musicHandlers['music.play'](playCtx({ gm: gm2, fetchImpl: audiusSearch([audiusTrackJson('b1', 'Slow Motion (From "Bharat")', 'Nakash Aziz')]) }), { query: 'Slow Motion From Bharat' });
+  assert.match(ok.message, /^▶️ Now playing \*\*Slow Motion \(From "Bharat"\) — Nakash Aziz/);
+});
+
+test('/play with an artist never plays another artist\'s different song (her jvke ≠ Golden Hour remix)', async () => {
+  const gm = gmFor({ adapter: fakeAdapter() });
+  const fetchImpl = audiusSearch([audiusTrackJson('j1', 'Golden Hour (Dani Remix) - JVKE', 'Dani'), audiusTrackJson('j2', 'Xecê Herdem Çavken', 'Shjeh')], [itunesHit('her', 'JVKE')]);
+  const res = await musicHandlers['music.play'](playCtx({ gm, fetchImpl }), { query: 'her jvke' });
+  assert.equal(res.ok, false);
+  assert.match(res.message, /\*\*her\*\* by JVKE isn't available/);
+  assert.doesNotMatch(res.message, /Herdem/, '"her" is not matched inside other words');
+  assert.equal(gm.queue.current, null);
+});
+
+test('same-recording matching: typos, joined spellings, filler words, versions only when asked', () => {
+  const ok = (q, title, artist = 'Someone') => matchQuality(q, { title, artist }).suitable;
+  assert.equal(ok('moonlight sonnata', 'Moonlight Sonata'), true, 'one-letter typo');
+  assert.equal(ok('lofi chill beats', 'Chill Lo-Fi Beats'), true, 'lo-fi = lofi');
+  assert.equal(ok('the song her by jvke', 'her', 'JVKE'), true, 'filler words ignored');
+  assert.equal(ok('slow motion', 'Slow Motion Dreams In Paris Tonight'), false, 'mostly a different title');
+  assert.equal(ok('blinding lights', 'Blinding Lights (Slowed + Reverb)'), false);
+  assert.equal(ok('blinding lights slowed', 'Blinding Lights (Slowed + Reverb)'), true, 'asked for the version');
+  assert.equal(ok('blinding lights', 'blinding lights (lo-fi)'), false);
+  assert.equal(ok('golden hour remix', 'Golden Hour (Dani Remix)'), true);
+  const { suitable } = rankForPlay('ocean eyes', [
+    { title: 'Ocean Eyes Extended Ocean Session Mix Tape', artist: 'A', score: 90 },
+    { title: 'Ocean Eyes', artist: 'B', score: 80 },
+  ]);
+  assert.equal(suitable[0].artist, 'B', 'the exact title outranks a longer near-match');
+});
+
+test('empty or blank /play queries are rejected by validation, not by a follow-up question', () => {
+  const def = getAction('music.play');
+  assert.equal(validateParams(def.params, { query: '' }).ok, false);
+  assert.equal(validateParams(def.params, { query: '   ' }).ok, false);
+  assert.equal(validateParams(def.params, { query: 'x' }).ok, true, 'any non-empty query is searched as-is');
+  assert.equal('pick' in def.params, false, '/play has no picker mode');
 });

@@ -1,7 +1,7 @@
 // AEGIS music actions (shared by slash commands, typed ALPHA and voice).
 import crypto from 'node:crypto';
 import { ActionRowBuilder, StringSelectMenuBuilder } from 'discord.js';
-import { searchTracks, resolveLink, describeTrack, musicErrorMessage, MusicError, formatMs } from '../../features/music/providers.js';
+import { searchTracks, rankForPlay, matchQuality, resolveLink, describeTrack, musicErrorMessage, MusicError, formatMs } from '../../features/music/providers.js';
 import { voicePermissionProblem } from '../../features/music/discordAdapter.js';
 import { guardianEmbed, safeText, STATUS_COLORS } from '../../core/discord/theme.js';
 import { AUTH } from '../../core/auth.js';
@@ -64,8 +64,9 @@ export async function enqueueTrack(ctx, track, voiceChannelId, textChannelId) {
   const r = await gm.enqueue(stamp(track, ctx.request?.userId), { voiceChannelId, textChannelId });
   const where = track.page ? ` · <${track.page}>` : '';
   if (r.started) {
+    const fallback = r.started.id !== track.id && r.started.fallbackFor ? ' — another upload of the same song, because the top match could not be streamed' : '';
     const skippedNote = r.errors?.length ? `\n⚠️ ${startFailureMessage(r.errors)}` : '';
-    return { ok: true, verified: true, message: `▶️ Now playing **${safeText(describeTrack(r.started), 200)}** (${formatMs(r.started.durationMs)})${r.started.id === track.id ? where : ''}${skippedNote}` };
+    return { ok: true, verified: true, message: `▶️ Now playing **${safeText(describeTrack(r.started), 200)}** (${formatMs(r.started.durationMs)})${r.started.id === track.id ? where : ''}${fallback}${skippedNote}` };
   }
   if (r.errors?.length) return { ok: false, message: startFailureMessage(r.errors) };
   return { ok: true, verified: true, message: `➕ Queued at #${r.position}: **${safeText(describeTrack(track), 200)}** (${formatMs(track.durationMs)})${where}` };
@@ -104,12 +105,23 @@ function pickMenu(token, results) {
     .toJSON();
 }
 
-function unavailableMessage(query, { weak, failed, metadata }) {
-  const down = failed.length ? ` (${failed.map((f) => f.provider).join(', ')} unavailable right now)` : '';
-  const meta = metadata?.[0];
-  const found = meta ? `I found **${safeText(meta.title, 80)}** by ${safeText(meta.artist ?? 'unknown', 60)} in the Apple Music catalogue, but it is **not available from a source bots may stream**${down}.` : `"${safeText(query, 80)}" is not available from a playable source${down}.`;
-  const alt = weak.length ? `\nPlayable alternatives: ${weak.slice(0, 3).map((t) => `"${safeText(t.title, 50)}"`).join(', ')} — try \`/search\`.` : '\nTry another title, an Audius/Jamendo link, or `/search`.';
-  return `${found}${alt}`;
+/** One concise message when no permitted source can stream the requested recording. Nothing is played. */
+export function unavailableMessage(query, { alternatives = [], failed = [], metadata = [] }) {
+  const down = failed.length ? ` (${failed.map((f) => f.provider).join(', ')} unreachable right now)` : '';
+  const meta = metadata[0];
+  const what = meta ? `**${safeText(meta.title, 80)}** by ${safeText(meta.artist ?? 'unknown', 60)}` : `"${safeText(query, 80)}"`;
+  const alt = alternatives.length ? ` Playable alternatives: ${alternatives.slice(0, 3).map((t) => `"${safeText(t.title, 50)}"`).join(', ')}.` : '';
+  return `🚫 ${what} isn't available from any source AEGIS may legally stream${down}, so nothing was played.${alt} Browse with \`/search ${safeText(query, 80)}\`.`;
+}
+
+/** Fallback uploads of the same recording, tried automatically if the first stream fails. */
+const MAX_FALLBACKS = 2;
+
+/** Do two artist credits share a name ("Shreya Ghoshal & Nakash Aziz" vs "Nakash Aziz")? */
+function sameArtist(a, b) {
+  const split = (s) => String(s ?? '').toLowerCase().split(/\s*(?:,|&|\band\b|\bx\b|\bfeat\.?|\bft\.?)\s*/).map((x) => x.replace(/[^\p{L}\p{N}]/gu, '')).filter(Boolean);
+  const bs = new Set(split(b));
+  return split(a).some((x) => bs.has(x));
 }
 
 export const musicHandlers = {
@@ -137,15 +149,18 @@ export const musicHandlers = {
           message: `Added ${out.added} track(s) from **${safeText(r.playlist ?? 'playlist', 100)}**${out.skipped ? ` (${out.skipped} skipped: queue limit)` : ''}.${startNote}`,
         };
       }
-      if (query.replace(/[^\p{L}\p{N}]/gu, '').length < 2) return { ok: false, message: 'Tell me what to play, e.g. `/play lofi beats`.' };
-      const found = await searchTracks(query, { config: ctx.config, logger: ctx.logger, withMetadata: true });
-      if (!found.results.length) return { ok: false, message: unavailableMessage(query, found) };
-      if (found.ambiguous || (p.pick && found.results.length > 1)) {
-        const token = crypto.randomBytes(6).toString('hex');
-        pendingPicks.set(token, { results: found.results, userId: ctx.request.userId, guildId: ctx.guild.id, voiceChannelId: vc, textChannelId, expires: Date.now() + PICK_TTL_MS });
-        return { ok: true, message: `Several playable matches for "${safeText(query, 80)}" — choose one below.`, components: [pickMenu(token, found.results)] };
-      }
-      return await enqueueTrack(ctx, found.results[0], vc, textChannelId);
+      // One-command playback: search with the user's exact query and play the
+      // best match that is the requested recording. Never ask again or show a
+      // picker (that is what /search is for), never substitute another song.
+      const found = await searchTracks(query, { config: ctx.config, logger: ctx.logger, fetchImpl: ctx.fetchImpl, withMetadata: true, limit: 12 });
+      const { suitable, alternatives } = rankForPlay(query, found.weak);
+      const metadata = found.metadata.filter((m) => matchQuality(query, m).suitable);
+      if (!suitable.length) return { ok: false, message: unavailableMessage(query, { failed: found.failed, metadata, alternatives }) };
+      // Prefer an upload by an artist the catalogue credits for this title.
+      // (The reply always names the artist and source of what actually plays.)
+      const credited = (t) => metadata.some((m) => sameArtist(t.artist, m.artist));
+      const [best, ...rest] = [...suitable.filter(credited), ...suitable.filter((t) => !credited(t))];
+      return await enqueueTrack(ctx, { ...best, alternates: rest.slice(0, MAX_FALLBACKS).map((t) => stamp(t, ctx.request.userId)) }, vc, textChannelId);
     } catch (err) {
       if (!(err instanceof MusicError)) ctx.logger?.warn('music.play failed', { guildId: ctx.guild.id, err: err.message });
       return { ok: false, message: err instanceof MusicError ? musicErrorMessage(err) : `Something went wrong: ${safeText(err.message, 200)}` };
@@ -155,7 +170,7 @@ export const musicHandlers = {
   /** /search: playable results (selectable) and metadata-only results (listed, never played). */
   async 'music.search'(ctx, p) {
     prunePicks();
-    const found = await searchTracks(p.query, { config: ctx.config, logger: ctx.logger, withMetadata: true, limit: 8 });
+    const found = await searchTracks(p.query, { config: ctx.config, logger: ctx.logger, fetchImpl: ctx.fetchImpl, withMetadata: true, limit: 8 });
     const playable = found.results.length ? found.results : found.weak.filter((t) => t.score >= 30).slice(0, 5);
     const lines = playable.map((t, i) => `✅ **${i + 1}.** ${safeText(t.title, 80)} — ${safeText(t.artist ?? 'Unknown', 50)} · ${formatMs(t.durationMs)} · ${describeTrack(t).split(' · ').pop()}`);
     const metaLines = found.metadata.slice(0, 4).map((t) => `ℹ️ ${safeText(t.title, 80)} — ${safeText(t.artist ?? 'Unknown', 50)} · ${formatMs(t.durationMs)} · ${t.page ? `[metadata only](<${t.page}>)` : 'metadata only'}`);
