@@ -4,6 +4,7 @@
 // recovered or cleaned up; queue, volume and loop mode persist.
 import { EventEmitter } from 'node:events';
 import { MusicQueue, Mutex } from './queue.js';
+import { isPlayableTrack, MusicError } from './providers.js';
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 export const MAX_VOLUME = 100;
@@ -134,6 +135,9 @@ export class GuildMusic extends EventEmitter {
     return this.lock.run(async () => {
       clearTimeout(this.idleTimer);
       if (!tracks.length) throw new Error('Nothing to add.');
+      // Metadata-only results (e.g. the Apple catalogue) can never enter the playable queue.
+      tracks = tracks.filter(isPlayableTrack);
+      if (!tracks.length) throw new MusicError('unavailable', 'That result is metadata only and cannot be streamed.');
       if (this.queue.length >= this.maxQueue) throw new Error(`The queue is full (${this.maxQueue} tracks).`);
       await this.ensureConnection(voiceChannelId);
       this.textChannelId = textChannelId ?? this.textChannelId;

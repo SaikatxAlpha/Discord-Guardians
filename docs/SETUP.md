@@ -59,21 +59,29 @@ npm run check:discord
 npm run register
 ```
 
-## 4. Original welcome background
+## 4. Welcome message and image
 
-Copy your original Soul Society artwork to `assets\welcome\background.png`. Preview it with `npm run render:welcome` or `/welcome-test`. See [assets/welcome/README.md](../assets/welcome/README.md).
+New members get **one normal Discord message**: the welcome text, with the server's image shown below it.
 
-### Welcome message on the card
+```
+🎉 Welcome to VOIDWORKS, @Member!
+𓆩 Where Shadows Unite, Legends Awaken. 💜 𓆪
+[your welcome GIF/PNG, unchanged]
+```
 
-`/setup welcome message:` is drawn **inside** the card, in a panel under the tagline. Real joins and `/welcome-test` use exactly the same card.
-
-- **Placeholders:** `{mention}` (shown as @name on the card; it also pings the member in the post), `{name}`, `{username}`, `{server}`, `{count}`.
-- **Line breaks:** type `\n`, because slash-command options can't contain real new lines.
-- **Formatting:** `**bold**`, `*italic*`, `__underline__`, `~~strike~~`, `` `code` ``, `# heading`, `> quote`, `- bullet`, emoji and custom server emoji.
-
-Example: `# Welcome, {mention}!\nYou are soul **#{count}** of {server} 💜\n- Read #rules\n- Grab your roles`
-
-Long messages shrink (32 → 18 px) and wrap, up to 6 lines. Text beyond that is shortened with "…", and `/welcome-test` warns you when that happens.
+- **Text:** `/setup welcome message:`.
+  - **Placeholders:** `{mention}` (pings the new member), `{name}`, `{username}`, `{server}`, `{count}`.
+  - **Line breaks:** type `\n`.
+  - **Formatting:** normal Discord formatting and emoji.
+  - **Length:** up to 1000 characters; nothing is shortened to fit an image.
+  - **Example:** `🎉 Welcome to {server}, {mention}!\n𓆩 Where Shadows Unite, Legends Awaken. 💜 𓆪`
+- **Image:** `/setup welcome background:` with a PNG, JPG, WebP or **GIF** (≤ 8 MB).
+  - It is stored and sent **exactly as uploaded**: same size, same file, and animated GIFs stay animated. No text is drawn on it.
+  - `reset_background:true` removes it.
+  - Without a server image, the deployment default `assets\welcome\background.*` is used if present; otherwise the welcome is text only.
+- **Mentions:** only the new member can be pinged. `@everyone`, `@here` and role mentions in the text never ping.
+- **Preview:** `/welcome-test` posts exactly what a real join posts (same code, same saved settings) without pinging anyone. It tells you privately if welcomes are disabled or no channel/image is set.
+- **Requirements:** a welcome channel set with `/setup channel purpose:welcome`, and AEGIS needs **Send Messages** and **Attach Files** there. Without Attach Files, the text is still sent.
 
 ## 5. First run and server configuration
 

@@ -256,7 +256,7 @@ export function createAegis() {
         '**Next steps (admins):**',
         '1. `/setup channel` — pick welcome, alpha, music, reports and research channels.',
         '2. `/setup trusted` — besides the server owner, who may give `' + config.voice.wakeWord + '` commands.',
-        '3. `/setup welcome` — message, tagline and an optional custom background.',
+        '3. `/setup welcome` — welcome text and an optional image (PNG/JPG/WebP/GIF) shown below it.',
         '4. `/settings view` — review everything; `/voice diagnostics` — check voice.',
         '',
         'Music: `/play` searches licensed sources (Audius, Jamendo, Internet Archive).',

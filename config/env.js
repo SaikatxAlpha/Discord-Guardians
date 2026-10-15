@@ -22,7 +22,7 @@ export function loadEnv(file = path.join(ROOT, '.env')) {
 const SNOWFLAKE = /^\d{17,20}$/;
 const TOKEN = /^[\w-]{20,}\.[\w-]{4,}\.[\w-]{20,}$/;
 export const GROQ_STT_MODELS = ['whisper-large-v3-turbo', 'whisper-large-v3'];
-export const MUSIC_PROVIDER_IDS = ['audius', 'jamendo', 'archive', 'radio', 'local'];
+export const MUSIC_PROVIDER_IDS = ['audius', 'jamendo', 'openverse', 'archive', 'radio', 'local'];
 
 const list = (v) => (v || '').split(',').map((s) => s.trim()).filter(Boolean);
 const int = (v, d) => {
@@ -114,18 +114,24 @@ export function getConfig(env = process.env) {
     },
     tts: { enabled: bool(env.TTS_ENABLED, false) },
     music: {
-      providers: list(env.MUSIC_PROVIDERS || 'audius,jamendo,archive,radio,local').map((p) => p.toLowerCase()),
+      providers: list(env.MUSIC_PROVIDERS || 'audius,jamendo,openverse,archive,radio,local').map((p) => p.toLowerCase()),
       audiusAppName: env.AUDIUS_APP_NAME || 'SoulSocietyGuardians',
       jamendoClientId: env.JAMENDO_CLIENT_ID || '',
       // Show Apple Music catalogue matches as metadata-only search results (never played).
       metadataCatalog: bool(env.MUSIC_METADATA_CATALOG, true),
+      // Apple storefront used for identification (e.g. IN ranks Indian releases first).
+      metadataCountry: /^[a-z]{2}$/i.test(env.MUSIC_METADATA_COUNTRY ?? '') ? env.MUSIC_METADATA_COUNTRY.toUpperCase() : 'US',
+      // Openverse works without credentials (anonymous: 20 searches/min, 200/day);
+      // free registered credentials raise the limits.
+      openverseClientId: env.OPENVERSE_CLIENT_ID || '',
+      openverseClientSecret: env.OPENVERSE_CLIENT_SECRET || '',
       youtubeApiKey: env.YOUTUBE_API_KEY || '',
       localDir: env.MUSIC_DIR ? path.resolve(ROOT, env.MUSIC_DIR) : path.join(dataDir, 'music'),
       enableArchive: bool(env.MUSIC_ENABLE_ARCHIVE, true),
       enableRadio: bool(env.MUSIC_ENABLE_RADIO, false),
       idleLeaveMs: int(env.MUSIC_IDLE_LEAVE_SECONDS, 300) * 1000,
       maxQueue: int(env.MUSIC_MAX_QUEUE, 100),
-      maxStreams: int(env.MUSIC_MAX_STREAMS, 8),
+      maxStreams: int(env.MUSIC_MAX_STREAMS, 2), // ≈ 20–35 MB per stream; 2 suits 256 MB hosts
       defaultVolume: int(env.MUSIC_DEFAULT_VOLUME, 70),
     },
     research: {
@@ -178,6 +184,7 @@ export function validateConfig(cfg, { bots = [] } = {}) {
   if (!(cfg.voice.repeatBelow >= 0 && cfg.voice.repeatBelow <= cfg.voice.confirmBelow && cfg.voice.confirmBelow <= 1)) errors.push('Require 0 ≤ VOICE_REPEAT_BELOW ≤ VOICE_CONFIRM_BELOW ≤ 1.');
   for (const p of cfg.music.providers) if (!MUSIC_PROVIDER_IDS.includes(p)) errors.push(`MUSIC_PROVIDERS contains unknown provider "${p}".`);
   if (cfg.music.providers.includes('jamendo') && !cfg.music.jamendoClientId) warnings.push('Jamendo music is disabled until JAMENDO_CLIENT_ID is set (free).');
+  if (!cfg.music.providers.includes('openverse')) warnings.push('MUSIC_PROVIDERS does not include "openverse" (free Creative Commons full tracks, no key needed) — add it for wider music coverage.');
   if (cfg.healthPort && (cfg.healthPort < 1 || cfg.healthPort > 65535)) errors.push('HEALTH_PORT must be a valid TCP port.');
   try {
     new Intl.DateTimeFormat('en-US', { timeZone: cfg.timezone });

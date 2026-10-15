@@ -5,7 +5,7 @@ Two independent Discord guardians sharing one ALPHA core. Develop on Windows; ru
 | Guardian | Identity | Theme | Responsibilities |
 |---|---|---|---|
 | ⚔️ **KNIGHT** | The Guardian | violet | text & voice moderation, anti-spam/raid, escalation, cases, security logs, lockdown |
-| 🛡️ **AEGIS** | The Ancient Guardian | cyan / black-silver | online music (Audius, Jamendo, Internet Archive), ALPHA voice assistant, research, reports, channels/roles/permissions, schedules, events, aura economy, welcome cards |
+| 🛡️ **AEGIS** | The Ancient Guardian | cyan / black-silver | online music (Audius, Openverse/Jamendo, Internet Archive), ALPHA voice assistant, research, reports, channels/roles/permissions, schedules, events, aura economy, welcome messages with your own image/GIF |
 
 **Budget: ₹0.** There's no local LLM, no model weights, no GPU inference, and no paid API. Hosted AI (Groq's free plan, no card) is optional. Everything core is deterministic Node.js.
 
@@ -24,7 +24,7 @@ npm start                               # runs KNIGHT + AEGIS (Ctrl+C = clean sh
 Other commands:
 
 ```powershell
-npm test                 # 137 automated tests (Discord-independent)
+npm test                 # 155 automated tests (Discord-independent)
 npm run check:production -- --live   # production readiness (tokens, intents, Groq, Audius, storage)
 npm run smoke:login      # log both bots in with the current code, then disconnect (acts on nothing)
 npm run verify:media     # live Audius/Archive stream → Opus packets (add -- --builtin to test without FFmpeg)

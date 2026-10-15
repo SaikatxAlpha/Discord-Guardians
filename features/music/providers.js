@@ -7,10 +7,14 @@
 //            apps under the Audius Open Music License (public performance and
 //            streaming); artists can opt out, and gated tracks are skipped.
 //   jamendo  Jamendo API (free client_id, non-commercial). Creative Commons.
+//   openverse Openverse API (no key; optional free credentials). Openly licensed
+//            full tracks from Jamendo, Wikimedia Commons and ccMixter.
 //   archive  Internet Archive recordings with an explicit CC / public-domain licence.
 //   radio    radio-browser.info stations (opt-in; station terms apply).
 //   url      direct https audio files and .m3u/.pls playlists supplied by admins.
 //   local    optional folder on the host (never required).
+//
+// Apple's iTunes Search API identifies songs (METADATA ONLY, never played).
 //
 // YouTube / Spotify / SoundCloud links are accepted for METADATA ONLY: the
 // title is looked up through their public oEmbed endpoints and then searched
@@ -212,6 +216,7 @@ export const audius = {
 const jamendoTrack = (t) => ({
   provider: 'jamendo',
   id: String(t.id),
+  canonical: `jamendo:${t.id}`,
   title: t.name,
   artist: t.artist_name ?? null,
   durationMs: (Number(t.duration) || 0) * 1000,
@@ -250,6 +255,88 @@ export const jamendo = {
   },
 };
 
+// ------------------------------------------------------------------ Openverse (Creative Commons audio)
+
+// Openverse (by WordPress.org) indexes openly licensed audio and returns the
+// original file URL. Only sources that serve full tracks are used: Jamendo
+// (full-length MP3s), Wikimedia Commons and ccMixter. Freesound is excluded
+// (mostly sound effects, served as "preview" renditions). Every result carries
+// a Creative Commons licence; title, creator and licence are shown when played.
+const OPENVERSE = 'https://api.openverse.org/v1';
+const OPENVERSE_SOURCES = ['jamendo', 'wikimedia_audio', 'ccmixter'];
+const OPENVERSE_SOURCE_LABEL = { jamendo: 'Jamendo', wikimedia_audio: 'Wikimedia Commons', ccmixter: 'ccMixter' };
+const MIN_FULL_TRACK_MS = 30000;
+const openverseCache = new Map(); // query -> { at, results } (anonymous use is limited to 200 searches/day)
+let openverseToken = null; // { token, expires }
+
+async function openverseAuth(config, fetchImpl) {
+  const { openverseClientId: id, openverseClientSecret: secret } = config.music;
+  if (!id || !secret) return {};
+  if (openverseToken && openverseToken.expires > Date.now() + 60000) return { Authorization: `Bearer ${openverseToken.token}` };
+  try {
+    const res = await fetchImpl(`${OPENVERSE}/auth_tokens/token/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA },
+      body: new URLSearchParams({ grant_type: 'client_credentials', client_id: id, client_secret: secret }).toString(),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return {}; // fall back to anonymous access
+    const j = await res.json();
+    openverseToken = { token: j.access_token, expires: Date.now() + (Number(j.expires_in) || 3600) * 1000 };
+    return { Authorization: `Bearer ${openverseToken.token}` };
+  } catch {
+    return {};
+  }
+}
+
+/** Formats the built-in decoder can play; others need FFmpeg. */
+async function decodableFiletypes() {
+  const { detectFfmpeg } = await import('./audioEngine.js');
+  return detectFfmpeg().available ? null : new Set(['mp3', 'mp32']);
+}
+
+export const openverse = {
+  id: 'openverse',
+  name: 'Openverse',
+  enabled: (config) => config.music.providers.includes('openverse'),
+  async search(query, { config, fetchImpl = fetch, limit = 6 }) {
+    const key = query.trim().toLowerCase();
+    const hit = openverseCache.get(key);
+    if (hit && Date.now() - hit.at < 10 * 60000) return hit.results.map((t) => ({ ...t }));
+    const url = `${OPENVERSE}/audio/?q=${encodeURIComponent(query)}&page_size=${Math.min(20, limit * 2)}&source=${OPENVERSE_SOURCES.join(',')}&mature=false`;
+    let res;
+    try {
+      res = await fetchImpl(url, { headers: { 'User-Agent': UA, Accept: 'application/json', ...(await openverseAuth(config, fetchImpl)) }, signal: AbortSignal.timeout(12000) });
+    } catch (err) {
+      throw new MusicError('outage', `Openverse did not respond (${err.name === 'TimeoutError' ? 'timeout' : 'network error'}).`);
+    }
+    if (res.status === 429) throw new MusicError('rate_limited', 'Openverse search limit reached (anonymous: 200/day); add free OPENVERSE_CLIENT_ID/SECRET to raise it.');
+    if (!res.ok) throw new MusicError(res.status >= 500 ? 'outage' : 'unavailable', `Openverse refused the search (HTTP ${res.status}).`);
+    const data = await res.json();
+    const decodable = await decodableFiletypes();
+    const results = (data.results ?? [])
+      .filter((r) => OPENVERSE_SOURCES.includes(r.source) && /^https:\/\//.test(r.url ?? '') && (r.duration ?? 0) >= MIN_FULL_TRACK_MS)
+      .filter((r) => !decodable || decodable.has(String(r.filetype ?? '').toLowerCase()))
+      .slice(0, limit)
+      .map((r) => ({
+        provider: 'openverse',
+        source: r.source,
+        id: r.id,
+        // The same Jamendo track found directly and through Openverse is one track.
+        canonical: r.source === 'jamendo' && /trackid=(\d+)/.exec(r.url) ? `jamendo:${/trackid=(\d+)/.exec(r.url)[1]}` : `openverse:${r.id}`,
+        title: r.title,
+        artist: r.creator ?? null,
+        durationMs: r.duration,
+        page: r.foreign_landing_url ?? null,
+        license: `CC ${String(r.license ?? '').toUpperCase()} ${r.license_version ?? ''}`.trim(),
+        input: r.url,
+      }));
+    openverseCache.set(key, { at: Date.now(), results });
+    if (openverseCache.size > 200) openverseCache.delete(openverseCache.keys().next().value);
+    return results.map((t) => ({ ...t }));
+  },
+};
+
 // ------------------------------------------------------------------ Internet Archive
 
 export async function searchArchive(query, { fetchImpl = fetch, limit = 6 } = {}) {
@@ -273,7 +360,10 @@ export async function searchArchive(query, { fetchImpl = fetch, limit = 6 } = {}
 export async function resolveArchiveStream(track, { fetchImpl = fetch } = {}) {
   const meta = await http(`https://archive.org/metadata/${encodeURIComponent(track.identifier)}`, { fetchImpl });
   const files = meta.files ?? [];
-  const pick = files.find((f) => /VBR MP3|128Kbps MP3|MP3/i.test(f.format ?? '')) ?? files.find((f) => /Ogg Vorbis/i.test(f.format ?? ''));
+  // Multi-track items (albums): prefer the file whose title matches this track, MP3 first.
+  const fileScore = (f) => matchScore(track.wanted ?? track.title ?? '', { title: f.title ?? f.name ?? '', artist: f.creator ?? '' });
+  const best = (re) => files.filter((f) => re.test(f.format ?? '')).sort((a, b) => fileScore(b) - fileScore(a))[0];
+  const pick = best(/VBR MP3|128Kbps MP3|MP3/i) ?? best(/Ogg Vorbis/i);
   if (!pick) throw new MusicError('unavailable', 'No playable audio file in that Internet Archive item.');
   return `https://archive.org/download/${encodeURIComponent(track.identifier)}/${pick.name.split('/').map(encodeURIComponent).join('/')}`;
 }
@@ -478,8 +568,8 @@ export const itunes = {
   id: 'itunes',
   name: 'Apple Music catalogue',
   enabled: (config) => config.music.metadataCatalog !== false,
-  async search(query, { fetchImpl, limit = 5 }) {
-    const data = await http(`https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&entity=song&limit=${limit}`, { fetchImpl });
+  async search(query, { fetchImpl, limit = 10, country = 'US' }) {
+    const data = await http(`https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&entity=song&limit=${limit}&country=${encodeURIComponent(country)}`, { fetchImpl });
     return (data.results ?? []).map((t) => ({
       provider: 'itunes',
       id: String(t.trackId),
@@ -487,29 +577,54 @@ export const itunes = {
       artist: t.artistName ?? null,
       durationMs: t.trackTimeMillis ?? 0,
       page: t.trackViewUrl ?? null,
+      genre: t.primaryGenreName ?? null,
       playable: false,
       license: 'Metadata only — not licensed for bot playback',
     }));
   },
 };
 
-export const SEARCH_PROVIDERS = { audius, jamendo, archive, radio, local };
+export const SEARCH_PROVIDERS = { audius, jamendo, openverse, archive, radio, local };
 export const LINK_PROVIDERS = [audius, jamendo, archive];
 
 export function enabledProviders(config) {
   return config.music.providers.map((id) => SEARCH_PROVIDERS[id]).filter((p) => p && p.enabled(config));
 }
 
-const WEIGHT = { local: 6, audius: 4, jamendo: 3, archive: 0, radio: -5 };
+const WEIGHT = { local: 6, audius: 4, jamendo: 3, openverse: 3, archive: 0, radio: -5 };
 
 /**
  * Search all enabled providers in parallel. Returns ranked candidates, the
  * providers that failed, and whether the choice is ambiguous.
  */
-export async function searchTracks(query, { config, fetchImpl = fetch, logger, limit = 5, withMetadata = false } = {}) {
+// Providers that can be slow for queries they have not seen recently.
+const SLOW_PROVIDERS = new Set(['openverse']);
+
+/**
+ * Query providers in parallel. Once the fast ones have answered with a good
+ * match, a slow provider gets only `graceMs` more; its request keeps running
+ * and fills its cache for the next search instead of delaying this one.
+ */
+async function searchAll(providers, query, { config, fetchImpl, graceMs }) {
+  const tasks = providers.map((p) => p.search(query, { config, fetchImpl, limit: 6 }));
+  const fast = await Promise.allSettled(tasks.filter((_, i) => !SLOW_PROVIDERS.has(providers[i].id)));
+  const good = fast.some((s) => s.status === 'fulfilled' && s.value.some((t) => matchScore(query, t) >= 60));
+  const late = new MusicError('outage', 'did not answer in time');
+  return Promise.all(
+    tasks.map((task, i) => {
+      const settle = task.then((value) => ({ status: 'fulfilled', value }), (reason) => ({ status: 'rejected', reason }));
+      if (!SLOW_PROVIDERS.has(providers[i].id) || !good) return settle;
+      let timer;
+      const grace = new Promise((resolve) => (timer = setTimeout(() => resolve({ status: 'rejected', reason: late }), graceMs)));
+      return Promise.race([settle, grace]).finally(() => clearTimeout(timer));
+    }),
+  );
+}
+
+export async function searchTracks(query, { config, fetchImpl = fetch, logger, limit = 5, withMetadata = false, graceMs = 3000 } = {}) {
   const providers = enabledProviders(config);
-  const metaPromise = withMetadata && itunes.enabled(config) ? itunes.search(query, { fetchImpl, limit: 5 }).catch(() => []) : Promise.resolve([]);
-  const settled = await Promise.allSettled(providers.map((p) => p.search(query, { config, fetchImpl, limit: 6 })));
+  const metaPromise = withMetadata && itunes.enabled(config) ? itunes.search(query, { fetchImpl, limit: 10, country: config.music.metadataCountry }).catch(() => []) : Promise.resolve([]);
+  const settled = await searchAll(providers, query, { config, fetchImpl, graceMs });
   const results = [];
   const failed = [];
   settled.forEach((s, i) => {
@@ -524,11 +639,12 @@ export async function searchTracks(query, { config, fetchImpl = fetch, logger, l
     t.score = matchScore(query, t) + (WEIGHT[t.provider] ?? 0) + Math.min(5, Math.log10(1 + (t.plays ?? 0)));
   }
   results.sort((a, b) => b.score - a.score);
-  const strong = results.filter((t) => t.score >= 45);
+  const unique = dedupeTracks(results);
+  const strong = unique.filter((t) => t.score >= 45);
   const top = strong[0];
   const ambiguous = Boolean(top && strong[1] && top.score < 95 && strong[1].score >= top.score - 8);
-  const metadata = (await metaPromise).filter((m) => matchScore(query, m) >= 45);
-  return { results: strong.slice(0, limit), weak: results.slice(0, limit), ambiguous, failed, metadata };
+  const metadata = dedupeTracks((await metaPromise).filter((m) => matchScore(query, m) >= 45));
+  return { results: strong.slice(0, limit), weak: unique.slice(0, limit), ambiguous, failed, metadata };
 }
 
 /**
@@ -553,9 +669,10 @@ export async function resolveLink(raw, { config, fetchImpl = fetch, lookup, logg
     const service = meta?.service ?? 'That service';
     const policy = `${service} audio cannot be streamed into Discord under its terms`;
     if (!title) throw new MusicError('restricted', `${policy}, and its title could not be read. Search by song name instead.`);
-    const found = await searchTracks(title, { config, fetchImpl, logger });
-    if (!found.results.length) throw new MusicError('not_found', `${policy}. "${title}" was not found on a licensed source (Audius, Jamendo, Internet Archive).`);
-    return { tracks: [found.results[0]], note: `${policy}; playing the closest licensed match for "${title}" instead.` };
+    const found = await searchTracks(cleanVideoTitle(title), { config, fetchImpl, logger, withMetadata: true, limit: 12 });
+    const choice = choosePlayable(cleanVideoTitle(title), found);
+    if (!choice.tracks.length) throw new MusicError('not_found', `${policy}, and "${title}" is not available from a source AEGIS may stream.`);
+    return { tracks: [choice.tracks[0]], note: `${policy}; playing the same song from ${describeTrack(choice.tracks[0]).split(' · ').pop()} instead.` };
   }
   for (const p of LINK_PROVIDERS) if (p.handles(u)) {
     if (!p.enabled(config) && p.id !== 'jamendo') throw new MusicError('config', `${p.name} is disabled on this deployment.`);
@@ -567,10 +684,128 @@ export async function resolveLink(raw, { config, fetchImpl = fetch, lookup, logg
   return directUrl.resolve(new URL(v.url), { fetchImpl, lookup });
 }
 
-/** Final input (URL or path) for ffmpeg, resolved just before playback. */
+// ------------------------------------------------------------------ de-duplication and the playable guard
+
+/** Title without "(From "Film")", "(feat. …)", "(Official Audio)"-style parts. */
+export function canonicalTitle(title) {
+  return String(title ?? '')
+    .replace(/[([](?:from|feat\.?|ft\.?|featuring|with|official|original|full|audio|video|lyrics?|hd)\b[^)\]]*[)\]]/gi, ' ')
+    .replace(/\s+-\s+from\s+.*$/i, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const pageKey = (u) => {
+  try {
+    const x = new URL(u);
+    return `${x.hostname.replace(/^www\./, '')}${x.pathname.replace(/\/+$/, '')}`.toLowerCase();
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Remove duplicates (same provider id, same canonical source, same page URL,
+ * or same normalised title + artist), keeping the first (best-ranked) copy.
+ * Duplicates of a playable track are kept on it as `mirrors` so a failed
+ * stream can fall back to the same recording from another provider.
+ */
+export function dedupeTracks(list) {
+  const out = [];
+  const byKey = new Map();
+  for (const t of list) {
+    const keys = [
+      `id:${t.canonical ?? `${t.provider}:${t.id}`}`,
+      t.page ? `page:${pageKey(t.page)}` : null,
+      `ta:${normName(canonicalTitle(t.title))}|${normName(t.artist ?? '')}`,
+    ].filter(Boolean);
+    const first = keys.map((k) => byKey.get(k)).find(Boolean);
+    if (first) {
+      if (t.playable !== false && first.playable !== false && !keys.includes(`id:${first.canonical ?? `${first.provider}:${first.id}`}`)) (first.mirrors ??= []).push(t);
+      for (const k of keys) if (!byKey.has(k)) byKey.set(k, first);
+      continue;
+    }
+    for (const k of keys) byKey.set(k, t);
+    out.push(t);
+  }
+  return out;
+}
+
+/** Can this track be put in the playable queue? Metadata-only results never can. */
+export function isPlayableTrack(t) {
+  if (!t || t.playable === false || t.provider === 'itunes') return false;
+  if (t.provider === 'archive' || t.source === 'archive') return Boolean(t.identifier);
+  return typeof t.input === 'string' && t.input.length > 0;
+}
+
+// ------------------------------------------------------------------ choosing what /play plays
+
+const artistNames = (s) =>
+  String(s ?? '')
+    .toLowerCase()
+    .split(/\s*(?:,|&|\band\b|\bx\b|\bfeat\.?|\bft\.?|\/)\s*/)
+    .map((x) => x.replace(/[^\p{L}\p{N}]/gu, ''))
+    .filter(Boolean);
+
+/** Do two artist credits share a name ("Shreya Ghoshal & Nakash Aziz" vs "Nakash Aziz")? */
+export function sameArtist(a, b) {
+  const bs = new Set(artistNames(b));
+  return artistNames(a).some((x) => bs.has(x));
+}
+
+/** Is this exactly the requested title (ignoring the artist's name inside the title)? */
+function isSameTitle(t, query) {
+  const artistWords = new Set(normWords(t.artist ?? ''));
+  const want = normName(significant(query).filter((w) => !artistWords.has(w)).join(' '));
+  const strip = (s) => normName(significant(s).filter((w) => !artistWords.has(w)).join(' '));
+  return Boolean(want) && (strip(t.title) === want || strip(String(t.title).replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')) === want);
+}
+
+// Mood/genre words: a query made only of these ("chill lofi", "bollywood
+// romantic") asks for a kind of music, not one specific recording.
+const GENERIC_WORDS = new Set('lofi lo fi chill chillhop beats beat jazz jazzhop hip hop hiphop rap study sleep sleeping relax relaxing relaxation ambient piano guitar mix playlist instrumental rain focus calm calming edm house techno trance trap phonk classical bollywood hindi punjabi tamil telugu indian desi romantic love sad happy workout gym party dance meditation yoga acoustic retro synthwave vaporwave rock metal pop indie folk jazzy soft night morning summer vibes'.split(' '));
+const isGenericQuery = (q) => significant(q).length > 0 && significant(q).every((w) => GENERIC_WORDS.has(w));
+
+/**
+ * Decide what /play plays for a search, without asking the user anything.
+ * - Only results that are the requested recording qualify (matchQuality).
+ * - When Apple's catalogue knows songs with exactly this title, a same-titled
+ *   upload only counts if it is by one of those credited artists — otherwise
+ *   it is a different song that happens to share the name. (Classical works
+ *   are exempt: any performance of the piece is the piece.)
+ * @returns {{tracks:object[], identity:object|null, sameTitle:object[], alternatives:object[]}}
+ *   tracks: best first, each with `alternates` (same recording) for fallback.
+ */
+export function choosePlayable(query, found) {
+  const { suitable, alternatives } = rankForPlay(query, found.weak ?? found.results ?? []);
+  const catalogue = (found.metadata ?? []).filter((m) => isSameTitle(m, query) && matchQuality(query, m).suitable);
+  const identity = catalogue[0] ?? null;
+  const restricted = identity && !isGenericQuery(query) && !catalogue.some((m) => /classical|opera/i.test(m.genre ?? ''));
+  const credited = (t) => catalogue.some((m) => sameArtist(t.artist, m.artist));
+  const sameTitle = [];
+  let eligible = suitable;
+  if (restricted) {
+    // A known title: other artists' same-named songs are different songs, and
+    // looser titles ("In Slow Motion" for "Slow Motion") must match closely.
+    eligible = suitable.filter((t) => credited(t) || (!isSameTitle(t, query) && matchQuality(query, t).titleCoverage >= 0.75));
+    sameTitle.push(...suitable.filter((t) => !eligible.includes(t)));
+  }
+  // Prefer an upload by a credited artist; then the ranking order.
+  eligible = [...eligible.filter(credited), ...eligible.filter((t) => !credited(t))];
+  const tracks = eligible.map((t, i) => ({ ...t, ...(t.provider === 'archive' ? { wanted: query } : {}), alternates: [...(t.mirrors ?? []), ...eligible.slice(i + 1)].filter(isPlayableTrack).slice(0, 2) }));
+  // Name the catalogue's recordings of this title (up to two artists) — the
+  // store's first hit is not always the famous one.
+  const artists = [...new Set(catalogue.map((m) => m.artist).filter(Boolean))];
+  const named = identity
+    ? { ...identity, artist: `${artists.slice(0, 2).join(', ')}${artists.length > 2 ? ' and other catalogue artists' : ''}` }
+    : (found.metadata ?? []).find((m) => matchQuality(query, m).suitable) ?? null;
+  return { tracks, identity: tracks.length ? null : named, sameTitle, alternatives: [...sameTitle, ...alternatives.filter((a) => !sameTitle.includes(a))] };
+}
+
+/** Final input (URL or path) for the audio engine, resolved just before playback. */
 export async function streamInput(track, { fetchImpl } = {}) {
+  if (!isPlayableTrack(track)) throw new MusicError('unavailable', 'This result is metadata only and cannot be streamed.');
   if (track.provider === 'archive' || track.source === 'archive') return resolveArchiveStream(track, { fetchImpl });
-  if (!track.input) throw new MusicError('unavailable', 'This track has no playable stream.');
   return track.input;
 }
 
@@ -584,7 +819,8 @@ export function formatMs(ms) {
 
 export function describeTrack(t) {
   const label = `${t.title}${t.artist ? ` — ${t.artist}` : ''}`;
-  return `${label} · ${PROVIDER_LABEL[t.provider ?? t.source] ?? t.provider}${t.live ? ' (live)' : ''}`;
+  const where = t.provider === 'openverse' ? `${OPENVERSE_SOURCE_LABEL[t.source] ?? t.source} via Openverse` : PROVIDER_LABEL[t.provider ?? t.source] ?? t.provider;
+  return `${label} · ${where}${t.live ? ' (live)' : ''}`;
 }
 
 export function musicErrorMessage(err) {

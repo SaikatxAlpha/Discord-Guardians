@@ -63,7 +63,8 @@ This panel runs Node.js 22 directly, without Docker. Its installer blocks `ffmpe
 2. **Create `.env`** in the panel's file manager from `.env.production.example`. Set:
    - `KNIGHT_TOKEN`, `AEGIS_TOKEN`, `APP_ENV=production`, `COMMAND_SCOPE=global`
    - `DATA_DIR=./data`, `MUSIC_MAX_STREAMS=2`
-   - optionally `GROQ_API_KEY`, `JAMENDO_CLIENT_ID`
+   - `MUSIC_PROVIDERS=audius,jamendo,openverse,archive,radio`, `MUSIC_METADATA_COUNTRY=IN`
+   - optionally `GROQ_API_KEY`, `JAMENDO_CLIENT_ID`, `OPENVERSE_CLIENT_ID` + `OPENVERSE_CLIENT_SECRET`
 
    Never paste tokens anywhere else.
 3. **Startup settings:**
@@ -75,9 +76,9 @@ This panel runs Node.js 22 directly, without Docker. Its installer blocks `ffmpe
 7. **Verify in Discord:**
    - `/voice diagnostics` shows the engine.
    - `/play lofi` in a voice channel: "▶️ Now playing" appears only once audio is flowing.
-   - `/welcome-test` shows your saved welcome message inside the card.
+   - `/welcome-test` shows your welcome text as a normal message with your image (GIF/PNG) unchanged below it.
 
-Optional: if the panel lets you upload a static `ffmpeg` binary (Linux x64), set `FFMPEG_PATH=./bin/ffmpeg`. Every audio format then plays, and MP4 welcome cards work.
+Optional: if the panel lets you upload a static `ffmpeg` binary (Linux x64), set `FFMPEG_PATH=./bin/ffmpeg`. Every audio format then plays.
 
 ### Environment variables (`.env.production`)
 
@@ -90,8 +91,10 @@ Optional: if the panel lets you upload a static `ffmpeg` binary (Linux x64), set
 | `OWNER_ID` | optional | Bot operator. Has no power in other servers unless `OPERATOR_GLOBAL_ACCESS=true` |
 | `STT_LANGUAGE`, `STT_MODEL`, `STT_DAILY_LIMIT`, `STT_GUILD_DAILY_LIMIT` | optional | Voice defaults and quotas |
 | `MUSIC_PROVIDERS`, `MUSIC_MAX_STREAMS` | optional | Music sources and the global concurrent-stream cap (2 on 256 MB hosts) |
-| `MUSIC_METADATA_CATALOG` | optional | `true` (default): look titles up in the free iTunes Search API (metadata only, no key) |
-| `FFMPEG_PATH` | optional | ffmpeg binary. Without it music uses the built-in MP3/Opus decoder; MP4 welcome cards fall back to GIF/PNG |
+| `MUSIC_METADATA_CATALOG` | optional | `true` (default): identify songs with the free iTunes Search API (metadata only, never played) |
+| `MUSIC_METADATA_COUNTRY` | optional | Apple storefront for identification, e.g. `IN` (default `US`) |
+| `OPENVERSE_CLIENT_ID`, `OPENVERSE_CLIENT_SECRET` | optional | Free Openverse credentials; without them Openverse allows 200 anonymous searches/day |
+| `FFMPEG_PATH` | optional | ffmpeg binary. Without it music uses the built-in MP3/Opus decoder |
 | `HEALTH_PORT` | optional | HTTP `/health` endpoint for hosts that need a port |
 | `DATA_DIR=/app/data` | preset | Database, backups, uploaded welcome backgrounds (the volume) |
 

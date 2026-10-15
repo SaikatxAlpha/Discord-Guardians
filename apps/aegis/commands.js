@@ -455,13 +455,11 @@ export function aegisCommands({ listener, music }) {
           .addStringOption((o) => o.setName('purpose').setDescription('Purpose').setRequired(true).addChoices(...['welcome', 'leave', 'research', 'reports', 'announcements', 'alpha', 'music', 'securityLog', 'modLog'].map((v) => ({ name: v, value: v }))))
           .addChannelOption((o) => o.setName('channel').setDescription('Channel (omit to clear)').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
         .addSubcommand((s) => s.setName('welcome').setDescription('Welcome settings')
-          .addBooleanOption((o) => o.setName('enabled').setDescription('Send welcome cards'))
-          .addStringOption((o) => o.setName('format').setDescription('Card format').addChoices({ name: 'static PNG', value: 'png' }, { name: 'animated GIF', value: 'gif' }, { name: 'MP4 video', value: 'mp4' }))
-          .addStringOption((o) => o.setName('message').setDescription('Drawn on the card. {mention} {name} {server} {count}, **bold**, emoji, \\n = new line').setMaxLength(500))
+          .addBooleanOption((o) => o.setName('enabled').setDescription('Send welcome messages'))
+          .addStringOption((o) => o.setName('message').setDescription('Welcome text: {mention} {name} {server} {count}, **bold**, emoji; \\n = new line').setMaxLength(1000))
           .addStringOption((o) => o.setName('leave_message').setDescription('Template: {name} {server}').setMaxLength(500))
-          .addStringOption((o) => o.setName('tagline').setDescription('Card tagline, e.g. HAS ENTERED SOUL SOCIETY').setMaxLength(40))
-          .addAttachmentOption((o) => o.setName('background').setDescription('Custom card background (PNG/JPG/WebP, ≤ 8 MB, 1200×500 recommended)'))
-          .addBooleanOption((o) => o.setName('reset_background').setDescription('Use the default background again')))
+          .addAttachmentOption((o) => o.setName('background').setDescription('Image shown below the welcome text, sent unchanged (PNG/JPG/WebP/GIF, ≤ 8 MB)'))
+          .addBooleanOption((o) => o.setName('reset_background').setDescription('Remove the custom welcome image')))
         .addSubcommand((s) => s.setName('trusted').setDescription('Who may use ALPHA here (besides the server owner)')
           .addStringOption((o) => o.setName('action').setDescription('Action').setRequired(true).addChoices({ name: 'add', value: 'add' }, { name: 'remove', value: 'remove' }, { name: 'list', value: 'list' }))
           .addUserOption((o) => o.setName('user').setDescription('Trusted user'))
@@ -495,7 +493,7 @@ export function aegisCommands({ listener, music }) {
               title: 'Soul Society configuration',
               fields: [
                 { name: 'Channels', value: Object.entries(s.channels).map(([k, v]) => `${k}: ${v ? `<#${v}>` : '—'}`).join('\n') },
-                { name: 'Welcome', value: `${s.welcome.enabled ? 'on' : 'off'} · ${s.welcome.format}\n${safeText(s.welcome.message, 200)}` },
+                { name: 'Welcome', value: `${s.welcome.enabled ? 'on' : 'off'} · image ${s.welcome.background ? 'custom' : 'none'}\n${safeText(s.welcome.message, 200)}` },
                 { name: 'Reports', value: `daily ${s.reports.dailyEnabled ? `at ${s.reports.dailyTime}` : 'off'} · weekly ${s.reports.weeklyEnabled ? 'on' : 'off'}`, inline: true },
                 { name: 'ALPHA', value: `speak ${s.alpha.speakResponses ? 'on' : 'off'} · confirm medium voice ${s.alpha.confirmMediumFromVoice ? 'on' : 'off'} · text prefix ${s.alpha.textPrefixEnabled ? 'on' : 'off'}`, inline: true },
                 { name: 'Moderation', value: s.moderation.simulate ? '🧪 simulation (configure via KNIGHT /modconfig)' : '⚔️ enforcing', inline: true },
@@ -507,15 +505,11 @@ export function aegisCommands({ listener, music }) {
         if (sub === 'channel') set(`channels.${i.options.getString('purpose')}`, i.options.getChannel('channel')?.id ?? null);
         if (sub === 'welcome') {
           const e = i.options.getBoolean('enabled');
-          const f = i.options.getString('format');
           const m = i.options.getString('message');
           const l = i.options.getString('leave_message');
           if (e != null) set('welcome.enabled', e);
-          if (f) set('welcome.format', f);
           if (m) set('welcome.message', m);
           if (l) set('welcome.leaveMessage', l);
-          const tg = i.options.getString('tagline');
-          if (tg) set('welcome.tagline', tg.toUpperCase());
           if (i.options.getBoolean('reset_background')) {
             removeGuildBackground(app.config, i.guildId);
             set('welcome.background', null);
@@ -589,22 +583,22 @@ export function aegisCommands({ listener, music }) {
       },
     },
     {
-      data: new SlashCommandBuilder().setName('welcome-test').setDescription('Preview the welcome card').setDefaultMemberPermissions(P.ManageGuild)
-        .addUserOption((o) => o.setName('member').setDescription('Member to preview'))
-        .addStringOption((o) => o.setName('format').setDescription('Format').addChoices({ name: 'png', value: 'png' }, { name: 'gif', value: 'gif' }, { name: 'mp4', value: 'mp4' })),
+      data: new SlashCommandBuilder().setName('welcome-test').setDescription('Preview the welcome message exactly as new members see it').setDefaultMemberPermissions(P.ManageGuild)
+        .addUserOption((o) => o.setName('member').setDescription('Member to preview')),
       async execute(i, app) {
         await i.deferReply();
         const user = i.options.getUser('member') ?? i.user;
         const member = await i.guild.members.fetch(user.id);
         const settings = getGuildSettings(app.db, i.guildId);
-        // Exactly the same composition as a real join (saved message, tagline, background).
-        const w = await composeWelcome(member, { config: app.config, settings, format: i.options.getString('format') ?? settings.welcome.format, logger: app.logger });
-        const notes = ['-# Preview of a real join post' + (w.content ? ' (the mention above pings only on real joins)' : '') + '.'];
-        if (!settings.welcome.enabled) notes.push('-# ⚠️ Welcome messages are currently **disabled** — enable with `/setup welcome enabled:true`.');
-        if (w.card && !w.card.usedOriginal) notes.push('-# ⚠️ No background image configured — showing the built-in design. Upload one with `/setup welcome background:`.');
-        if (w.card?.message?.truncated) notes.push('-# ⚠️ The welcome message was too long for the card and was shortened.');
-        if (!w.card) notes.push('-# ⚠️ The card could not be rendered, so the message is shown as text.');
-        return i.editReply({ content: [w.content, ...notes].filter(Boolean).join('\n'), files: w.files, allowedMentions: { parse: [] } });
+        // Exactly the same message as a real join (same builder, same saved settings).
+        // The only difference: the preview pings nobody.
+        const w = composeWelcome(member, { config: app.config, settings });
+        await i.editReply({ content: w.content || null, files: w.files, allowedMentions: { parse: [] } });
+        const notes = [];
+        if (!settings.welcome.enabled) notes.push('⚠️ Welcome messages are **disabled** — enable with `/setup welcome enabled:true`.');
+        if (!settings.channels.welcome) notes.push('⚠️ No welcome channel is set — choose one with `/setup channel purpose:welcome`.');
+        if (!w.image) notes.push('ℹ️ No welcome image is set — add one with `/setup welcome background:` (PNG/JPG/WebP/GIF).');
+        if (notes.length) await i.followUp({ content: notes.join('\n'), flags: MessageFlags.Ephemeral });
       },
     },
     ...configCommands({ listener, music }),

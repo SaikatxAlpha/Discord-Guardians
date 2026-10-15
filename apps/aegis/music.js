@@ -1,7 +1,7 @@
 // AEGIS music actions (shared by slash commands, typed ALPHA and voice).
 import crypto from 'node:crypto';
 import { ActionRowBuilder, StringSelectMenuBuilder } from 'discord.js';
-import { searchTracks, rankForPlay, matchQuality, resolveLink, describeTrack, musicErrorMessage, MusicError, formatMs } from '../../features/music/providers.js';
+import { searchTracks, choosePlayable, resolveLink, describeTrack, musicErrorMessage, MusicError, formatMs } from '../../features/music/providers.js';
 import { voicePermissionProblem } from '../../features/music/discordAdapter.js';
 import { guardianEmbed, safeText, STATUS_COLORS } from '../../core/discord/theme.js';
 import { AUTH } from '../../core/auth.js';
@@ -46,7 +46,7 @@ export async function targetVoiceChannel(ctx) {
   return { channelId };
 }
 
-const stamp = (track, userId) => ({ ...track, requestedBy: userId, score: undefined, plays: undefined });
+const stamp = (track, userId) => ({ ...track, requestedBy: userId, score: undefined, plays: undefined, mirrors: undefined });
 
 function startFailureMessage(errors) {
   const e = errors.at(-1);
@@ -105,24 +105,22 @@ function pickMenu(token, results) {
     .toJSON();
 }
 
-/** One concise message when no permitted source can stream the requested recording. Nothing is played. */
-export function unavailableMessage(query, { alternatives = [], failed = [], metadata = [] }) {
+/**
+ * One concise message when no permitted source can stream the requested
+ * recording. Nothing is played; playable alternatives are named with their
+ * artist and source so the user can ask for one explicitly.
+ */
+export function unavailableMessage(query, { alternatives = [], failed = [], identity = null }) {
   const down = failed.length ? ` (${failed.map((f) => f.provider).join(', ')} unreachable right now)` : '';
-  const meta = metadata[0];
-  const what = meta ? `**${safeText(meta.title, 80)}** by ${safeText(meta.artist ?? 'unknown', 60)}` : `"${safeText(query, 80)}"`;
-  const alt = alternatives.length ? ` Playable alternatives: ${alternatives.slice(0, 3).map((t) => `"${safeText(t.title, 50)}"`).join(', ')}.` : '';
+  const what = identity ? `**${safeText(identity.title, 80)}** by ${safeText(identity.artist ?? 'unknown', 120)}` : `"${safeText(query, 80)}"`;
+  const label = (t) => `"${safeText(t.title, 50)}" by ${safeText(t.artist ?? 'unknown', 40)} (${describeTrack(t).split(' · ').pop()})`;
+  const ex = alternatives[0];
+  const alt = ex ? ` Playable alternatives: ${alternatives.slice(0, 3).map(label).join(', ')} — to play one, include its artist, e.g. \`/play ${safeText(ex.title, 50)} ${safeText(ex.artist ?? '', 40)}\`.` : '';
   return `🚫 ${what} isn't available from any source AEGIS may legally stream${down}, so nothing was played.${alt} Browse with \`/search ${safeText(query, 80)}\`.`;
 }
 
 /** Fallback uploads of the same recording, tried automatically if the first stream fails. */
 const MAX_FALLBACKS = 2;
-
-/** Do two artist credits share a name ("Shreya Ghoshal & Nakash Aziz" vs "Nakash Aziz")? */
-function sameArtist(a, b) {
-  const split = (s) => String(s ?? '').toLowerCase().split(/\s*(?:,|&|\band\b|\bx\b|\bfeat\.?|\bft\.?)\s*/).map((x) => x.replace(/[^\p{L}\p{N}]/gu, '')).filter(Boolean);
-  const bs = new Set(split(b));
-  return split(a).some((x) => bs.has(x));
-}
 
 export const musicHandlers = {
   async 'music.play'(ctx, p) {
@@ -153,14 +151,10 @@ export const musicHandlers = {
       // best match that is the requested recording. Never ask again or show a
       // picker (that is what /search is for), never substitute another song.
       const found = await searchTracks(query, { config: ctx.config, logger: ctx.logger, fetchImpl: ctx.fetchImpl, withMetadata: true, limit: 12 });
-      const { suitable, alternatives } = rankForPlay(query, found.weak);
-      const metadata = found.metadata.filter((m) => matchQuality(query, m).suitable);
-      if (!suitable.length) return { ok: false, message: unavailableMessage(query, { failed: found.failed, metadata, alternatives }) };
-      // Prefer an upload by an artist the catalogue credits for this title.
-      // (The reply always names the artist and source of what actually plays.)
-      const credited = (t) => metadata.some((m) => sameArtist(t.artist, m.artist));
-      const [best, ...rest] = [...suitable.filter(credited), ...suitable.filter((t) => !credited(t))];
-      return await enqueueTrack(ctx, { ...best, alternates: rest.slice(0, MAX_FALLBACKS).map((t) => stamp(t, ctx.request.userId)) }, vc, textChannelId);
+      const choice = choosePlayable(query, found);
+      if (!choice.tracks.length) return { ok: false, message: unavailableMessage(query, { failed: found.failed, identity: choice.identity, alternatives: choice.alternatives }) };
+      const [best] = choice.tracks;
+      return await enqueueTrack(ctx, { ...best, alternates: best.alternates.slice(0, MAX_FALLBACKS).map((t) => stamp(t, ctx.request.userId)) }, vc, textChannelId);
     } catch (err) {
       if (!(err instanceof MusicError)) ctx.logger?.warn('music.play failed', { guildId: ctx.guild.id, err: err.message });
       return { ok: false, message: err instanceof MusicError ? musicErrorMessage(err) : `Something went wrong: ${safeText(err.message, 200)}` };

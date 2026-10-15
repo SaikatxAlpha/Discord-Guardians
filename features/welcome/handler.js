@@ -1,18 +1,21 @@
-// Welcome and leave messages (sent by AEGIS). Everything is per server:
-// display name, tagline and an optional uploaded background stored under
-// DATA_DIR/backgrounds/<guildId>.<ext>.
+// Welcome and leave messages (sent by AEGIS). Everything is per server.
+//
+// A welcome post is a normal Discord message: the configured text in the
+// message content, with the server's own image (PNG/JPG/WebP/GIF) attached
+// below it exactly as uploaded — same bytes, size and animation. Nothing is
+// drawn onto the image. Uploaded images live in DATA_DIR/backgrounds/<guildId>.<ext>.
 import fs from 'node:fs';
 import path from 'node:path';
 import { AttachmentBuilder } from 'discord.js';
 import { loadImage } from '@napi-rs/canvas';
-import { renderWelcome, fetchAvatar, findBackground } from './renderer.js';
+import { findBackground } from './renderer.js';
 import { getGuildSettings } from '../../core/settings.js';
 import { fetchTextChannel } from '../../core/discord/send.js';
 import { safeText } from '../../core/discord/theme.js';
-import { escapeRich, parseMessage } from './richText.js';
 
 const MAX_BACKGROUND_BYTES = 8 * 1024 * 1024;
-const BG_TYPES = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' };
+const IMAGE_EXTS = ['png', 'jpg', 'webp', 'gif'];
+const MAX_CONTENT = 2000; // Discord message limit
 
 export function displayNameOf(guild, settings) {
   return settings?.branding?.displayName || guild?.name || 'this server';
@@ -23,57 +26,35 @@ export function displayNameOf(guild, settings) {
 const lineBreaks = (t) => String(t ?? '').replace(/\\n|<br\s*\/?>/gi, '\n');
 const PLACEHOLDER = /\{(mention|name|username|server|guild|count)\}/g;
 
-/**
- * Fill a welcome/leave template.
- * - mode 'text' (default): a Discord message; {mention} pings, values are markdown-escaped.
- * - mode 'image': text drawn on the card; mentions become readable "@name" / "#channel".
- */
-export function formatTemplate(template, { member, guild, settings = null, mode = 'text' }) {
-  const raw = {
-    name: member.displayName ?? member.user?.username ?? '',
-    username: member.user?.username ?? '',
-    server: displayNameOf(guild, settings),
-    guild: guild.name ?? '',
-    count: String(guild.memberCount ?? ''),
-  };
-  if (mode === 'image') {
-    const vars = { ...Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, escapeRich(v)])), mention: `@${escapeRich(raw.name)}` };
-    return lineBreaks(template)
-      .replace(PLACEHOLDER, (_, k) => vars[k])
-      .replace(/<@!?(\d{17,20})>/g, (_, id) => `@${escapeRich(guild.members?.cache?.get(id)?.displayName ?? 'member')}`)
-      .replace(/<@&(\d{17,20})>/g, (_, id) => `@${escapeRich(guild.roles?.cache?.get(id)?.name ?? 'role')}`)
-      .replace(/<#(\d{17,20})>/g, (_, id) => `#${escapeRich(guild.channels?.cache?.get(id)?.name ?? 'channel')}`);
-  }
+/** Fill a welcome/leave template: {mention} pings, user-controlled values are markdown-escaped. */
+export function formatTemplate(template, { member, guild, settings = null }) {
   const vars = {
     mention: `<@${member.id}>`,
-    name: safeText(raw.name, 64),
-    username: safeText(raw.username, 64),
-    server: safeText(raw.server, 100),
-    guild: safeText(raw.guild, 100),
-    count: raw.count,
+    name: safeText(member.displayName ?? member.user?.username ?? '', 64),
+    username: safeText(member.user?.username ?? '', 64),
+    server: safeText(displayNameOf(guild, settings), 100),
+    guild: safeText(guild.name ?? '', 100),
+    count: String(guild.memberCount ?? ''),
   };
   return lineBreaks(template).replace(PLACEHOLDER, (_, k) => vars[k]);
 }
 
-/** Download the custom emoji used in the message (bounded) so the card can draw them. */
-export async function fetchMessageEmoji(text, { fetchImpl, max = 8 } = {}) {
-  const wanted = new Map();
-  for (const line of parseMessage(text)) for (const r of line.runs) if (r.emoji && wanted.size < max) wanted.set(r.emoji.id, r.emoji);
-  const out = new Map();
-  await Promise.all(
-    [...wanted.keys()].map(async (id) => {
-      const buf = await fetchAvatar(`https://cdn.discordapp.com/emojis/${id}.png?size=64`, { fetchImpl, timeoutMs: 5000, maxBytes: 512 * 1024 });
-      if (buf) out.set(id, buf);
-    }),
-  );
-  return out;
+/** Identify an image by its bytes (never trust the declared content type). */
+export function imageTypeOf(buf) {
+  if (!buf || buf.length < 12) return null;
+  const ascii = (o, n) => buf.subarray(o, o + n).toString('latin1');
+  if (buf.readUInt32BE(0) === 0x89504e47) return 'png';
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+  if (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a') return 'gif';
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') return 'webp';
+  return null;
 }
 
 function backgroundDir(config) {
   return path.join(config.dataDir, 'backgrounds');
 }
 
-/** Background for a server: its upload, else the deployment default, else the built-in design. */
+/** The server's welcome image: its upload, else the deployment default (WELCOME_BACKGROUND / assets/welcome), else none. */
 export function backgroundFor(config, settings) {
   const file = settings?.welcome?.background;
   if (file && /^[\w.-]+$/.test(file)) {
@@ -83,48 +64,56 @@ export function backgroundFor(config, settings) {
   return findBackground(config?.welcome?.background);
 }
 
-/** Validate and store an uploaded background (image type, size, decodable). */
+/** Validate and store an uploaded welcome image byte-for-byte (type from its bytes, size, decodable). */
 export async function saveGuildBackground(config, guildId, attachment, { fetchImpl = fetch } = {}) {
-  const ext = BG_TYPES[(attachment.contentType ?? '').split(';')[0]];
-  if (!ext) throw new Error('Use a PNG, JPG or WebP image.');
+  if (attachment.contentType && !/^image\//i.test(attachment.contentType)) throw new Error('Use a PNG, JPG, WebP or GIF image.');
   if (attachment.size > MAX_BACKGROUND_BYTES) throw new Error('The image must be 8 MB or smaller.');
   if (!/^https:\/\/(cdn|media)\.discordapp\.(com|net)\//.test(attachment.url)) throw new Error('Unexpected attachment source.');
   const res = await fetchImpl(attachment.url, { signal: AbortSignal.timeout(15000) });
   if (!res.ok) throw new Error(`Could not download the image (HTTP ${res.status}).`);
   const buf = Buffer.from(await res.arrayBuffer());
   if (buf.length > MAX_BACKGROUND_BYTES) throw new Error('The image must be 8 MB or smaller.');
+  const ext = imageTypeOf(buf);
+  if (!ext) throw new Error('Use a PNG, JPG, WebP or GIF image.');
   const img = await loadImage(buf).catch(() => null);
-  if (!img || img.width < 400 || img.height < 160) throw new Error('That image could not be read or is too small (min 400×160).');
+  if (!img || img.width < 16 || img.height < 16) throw new Error('That image could not be read.');
   fs.mkdirSync(backgroundDir(config), { recursive: true });
   removeGuildBackground(config, guildId);
   const name = `${guildId}.${ext}`;
-  fs.writeFileSync(path.join(backgroundDir(config), name), buf);
+  fs.writeFileSync(path.join(backgroundDir(config), name), buf); // unchanged bytes: animation and size are kept
   return name;
 }
 
 export function removeGuildBackground(config, guildId) {
-  for (const ext of Object.values(BG_TYPES)) fs.rmSync(path.join(backgroundDir(config), `${guildId}.${ext}`), { force: true });
+  for (const ext of IMAGE_EXTS) fs.rmSync(path.join(backgroundDir(config), `${guildId}.${ext}`), { force: true });
 }
 
-export async function buildWelcomeCard(member, { config, settings = null, format = 'png', logger, fetchImpl, message = '' } = {}) {
-  const s = settings ?? null;
-  const emojiImages = message ? await fetchMessageEmoji(message, { fetchImpl }) : new Map();
-  const url = member.displayAvatarURL?.({ extension: 'png', size: 256, forceStatic: true }) ?? member.user?.displayAvatarURL?.({ extension: 'png', size: 256 });
-  const avatar = await fetchAvatar(url, { fetchImpl });
-  if (!avatar) logger?.warn('avatar download failed; using placeholder', { guildId: member.guild?.id });
-  return renderWelcome(
-    {
-      background: backgroundFor(config, s),
-      avatar,
-      displayName: member.displayName ?? member.user?.username,
-      tagline: s?.welcome?.tagline,
-      serverName: displayNameOf(member.guild, s),
-      message,
-      emojiImages,
-    },
-    format,
-    logger,
-  );
+function clampContent(text) {
+  if (text.length <= MAX_CONTENT) return text;
+  const g = [...new Intl.Segmenter('en', { granularity: 'grapheme' }).segment(text)].map((x) => x.segment);
+  let out = '';
+  for (const s of g) {
+    if (out.length + s.length > MAX_CONTENT - 1) break;
+    out += s;
+  }
+  return `${out}…`;
+}
+
+/**
+ * Build the welcome post for a member from the server's saved settings.
+ * Real joins AND /welcome-test both use this, so they always look the same:
+ * the configured text as the message content, the server's image attached
+ * unchanged below it. Only the joining member can be pinged.
+ */
+export function composeWelcome(member, { config, settings }) {
+  const image = backgroundFor(config, settings);
+  const files = image ? [new AttachmentBuilder(fs.readFileSync(image), { name: `welcome${path.extname(image).toLowerCase()}` })] : [];
+  return { ...welcomeText(member, settings), files, image };
+}
+
+function welcomeText(member, settings) {
+  const content = clampContent(formatTemplate(settings.welcome.message ?? '', { member, guild: member.guild, settings }).trim());
+  return { content, allowedMentions: { parse: [], users: [member.id] } };
 }
 
 export async function onMemberJoin(member, { db, config, logger }) {
@@ -136,45 +125,27 @@ export async function onMemberJoin(member, { db, config, logger }) {
     if (settings.channels.welcome) logger.warn('welcome channel invalid or inaccessible', { guildId: member.guild.id });
     return { sent: false, reason: 'no_channel' };
   }
-  const welcome = await composeWelcome(member, { config, settings, logger });
+  let welcome;
   try {
-    await channel.send({ content: welcome.content, files: welcome.files, allowedMentions: { users: [member.id] } });
-    return { sent: true, format: welcome.format, usedOriginal: welcome.card?.usedOriginal ?? false, message: welcome.card?.message ?? null };
+    welcome = composeWelcome(member, { config, settings });
   } catch (err) {
-    logger.error('welcome message failed', { guildId: member.guild.id, err: err.message });
-    return { sent: false, reason: 'send_failed' };
+    // An unreadable image file must not cost the member their welcome.
+    logger.warn('welcome image unavailable; sending text only', { guildId: member.guild.id, err: err.message });
+    welcome = { ...welcomeText(member, settings), files: [], image: null };
   }
-}
-
-/**
- * Build the complete welcome post for a member from the server's saved
- * settings. Real joins AND /welcome-test both use this, so they always match.
- * The configured message is drawn inside the card; the text content only
- * carries the ping (when the template uses {mention}). If the card cannot be
- * rendered, the full message is sent as text instead.
- */
-export async function composeWelcome(member, { config, settings, format = settings.welcome.format, logger, fetchImpl } = {}) {
-  const template = settings.welcome.message ?? '';
-  const textMessage = formatTemplate(template, { member, guild: member.guild, settings });
+  const send = (payload) => channel.send({ content: payload.content || null, files: payload.files, allowedMentions: payload.allowedMentions });
   try {
-    const card = await buildWelcomeCard(member, {
-      config,
-      settings,
-      format,
-      logger,
-      fetchImpl,
-      message: formatTemplate(template, { member, guild: member.guild, settings, mode: 'image' }),
-    });
-    return {
-      content: template.includes('{mention}') ? `<@${member.id}>` : '',
-      files: [new AttachmentBuilder(card.buffer, { name: `welcome-${member.id}.${card.format}` })],
-      format: card.format,
-      card,
-      textMessage,
-    };
+    await send(welcome);
+    return { sent: true, withImage: welcome.files.length > 0 };
   } catch (err) {
-    logger?.error('welcome card failed; using text only', { guildId: member.guild?.id, err: err.message });
-    return { content: textMessage, files: [], format: 'text', card: null, textMessage };
+    if (!welcome.files.length || !welcome.content) {
+      logger.error('welcome message failed', { guildId: member.guild.id, err: err.message });
+      return { sent: false, reason: 'send_failed' };
+    }
+    // e.g. missing "Attach Files" permission: still greet with the text.
+    logger.warn('welcome image could not be sent; sending text only', { guildId: member.guild.id, err: err.message });
+    await send({ ...welcome, files: [] }).catch((e) => logger.error('welcome message failed', { guildId: member.guild.id, err: e.message }));
+    return { sent: true, withImage: false };
   }
 }
 

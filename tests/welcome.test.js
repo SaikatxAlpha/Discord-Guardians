@@ -4,8 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import { renderWelcomePng, renderWelcomeGif, renderWelcome, sanitizeDisplayName, fetchAvatar, CARD_W, CARD_H } from '../features/welcome/renderer.js';
-import { formatTemplate, onMemberJoin, composeWelcome, fetchMessageEmoji } from '../features/welcome/handler.js';
+import gifenc from 'gifenc';
+import { formatTemplate, onMemberJoin, composeWelcome, saveGuildBackground, removeGuildBackground, imageTypeOf } from '../features/welcome/handler.js';
+import { aegisCommands } from '../apps/aegis/commands.js';
 import { parseInline, parseMessage, escapeRich } from '../features/welcome/richText.js';
+
+const { GIFEncoder, quantize, applyPalette } = gifenc;
 import { setGuildSetting } from '../core/settings.js';
 import { memoryLogger } from '../core/logger.js';
 import { buildMockGuild } from './mocks/discord.js';
@@ -118,29 +122,6 @@ test('each server gets its own branding, tagline and background on the card', as
   assert.notDeepEqual(a.buffer, b.buffer);
 });
 
-test('join handler sends the card to the configured channel and survives an invalid channel id', async () => {
-  const { guild, channels, members } = buildMockGuild();
-  const db = memDb();
-  const config = testConfig({ ownerId: guild.ownerId });
-  members.john.displayAvatarURL = () => 'https://invalid.invalid/avatar.png';
-  assert.equal((await onMemberJoin(members.john, { db, config, logger: memoryLogger() })).reason, 'no_channel');
-  setGuildSetting(db, guild.id, 'channels.welcome', '999999999999999999');
-  assert.equal((await onMemberJoin(members.john, { db, config, logger: memoryLogger() })).reason, 'no_channel');
-  setGuildSetting(db, guild.id, 'channels.welcome', channels.general.id);
-  const r = await onMemberJoin(members.john, { db, config, logger: memoryLogger() });
-  assert.equal(r.sent, true);
-  const msg = channels.general.messages.at(-1);
-  assert.equal(msg.files.length, 1);
-  assert.deepEqual(msg.allowedMentions, { users: [members.john.id] });
-  assert.equal(db.get(`SELECT COUNT(*) AS n FROM member_events WHERE type = 'join'`).n, 3);
-});
-
-// ------------------------------------------------------------------ the configured welcome message on the card
-
-const noNetwork = async () => {
-  throw new Error('no network in tests');
-};
-
 test('rich text: Discord-style bold/italic/underline/strike/code, custom emoji, unmatched markers stay literal', () => {
   const runs = parseInline('Hi **bold** _it_ __u__ ~~s~~ `c` <:pog:123456789012345678> 2*3 a_b');
   const pick = (text) => runs.find((r) => r.text === text);
@@ -155,68 +136,6 @@ test('rich text: Discord-style bold/italic/underline/strike/code, custom emoji, 
   const lines = parseMessage('# Title\n> quoted\n- item\n\n\n\nend');
   assert.deepEqual(lines.map((l) => l.runs.map((r) => r.text).join('')), ['Title', 'quoted', '• item', '', 'end'], 'blank-line runs collapsed');
   assert.equal(lines[0].runs[0].bold, true, 'headings are bold');
-});
-
-test('image-mode templates: line breaks, readable mentions, member names cannot inject formatting', () => {
-  const { guild, members, channels } = buildMockGuild();
-  const john = members.john;
-  john.displayName = '**Evil** _name_';
-  const out = formatTemplate('Hey {mention}!\\nRead <#' + channels.general.id + '>, then say hi to <@' + members.bob.id + '>.<br>Soul #{count} of {server}', { member: john, guild, settings: null, mode: 'image' });
-  const lines = parseMessage(out).map((l) => l.runs.map((r) => r.text).join(''));
-  assert.deepEqual(lines, [`Hey @**Evil** _name_!`, 'Read #general, then say hi to @Bob.', `Soul #${guild.memberCount} of ${guild.name}`]);
-  assert.ok(parseMessage(out)[0].runs.every((r) => !r.bold && !r.italic), "a member's name never becomes markup");
-  assert.match(formatTemplate('a\\nb', { member: john, guild }), /^a\nb$/, 'text mode supports \\n too');
-});
-
-test('the saved welcome message reaches the renderer and is drawn inside the card, below the tagline', async () => {
-  const { guild, channels, members } = buildMockGuild();
-  const db = memDb();
-  const config = testConfig({ ownerId: guild.ownerId });
-  members.john.displayAvatarURL = () => 'https://invalid.invalid/avatar.png';
-  setGuildSetting(db, guild.id, 'channels.welcome', channels.general.id);
-  setGuildSetting(db, guild.id, 'welcome.message', 'Hey {mention} 👋\\nWelcome to **{server}** — enjoy 💜');
-  const r = await onMemberJoin(members.john, { db, config, logger: memoryLogger() });
-  assert.equal(r.sent, true);
-  assert.deepEqual(r.message.lines, ['Hey @John 👋', `Welcome to ${guild.name} — enjoy 💜`]);
-  const msg = channels.general.messages.at(-1);
-  assert.equal(msg.content, `<@${members.john.id}>`, 'the text only carries the ping; the message is on the card');
-  const png = msg.files[0].attachment;
-  const img = await loadImage(png);
-  assert.ok(img.height > CARD_H, 'the card grows to make room for the message');
-  assert.ok(r.message.panel.y > r.message.taglineY, 'message panel starts below the tagline');
-  assert.ok(r.message.panel.y + r.message.panel.h <= img.height, 'panel fits inside the image');
-
-  // Different message text → different pixels in the panel, identical hero section.
-  setGuildSetting(db, guild.id, 'welcome.message', 'Something completely different');
-  await onMemberJoin(members.john, { db, config, logger: memoryLogger() });
-  const other = channels.general.messages.at(-1);
-  assert.equal(other.content, '', 'no {mention} in the template → no ping');
-  const crop = async (buf, x, y, w, h) => {
-    const im = await loadImage(buf);
-    const c = createCanvas(w, h);
-    c.getContext('2d').drawImage(im, -x, -y);
-    return Buffer.from(c.getContext('2d').getImageData(0, 0, w, h).data);
-  };
-  const avatar = [CARD_W / 2 - 60, CARD_H * 0.4 - 60, 120, 120];
-  assert.ok((await crop(png, ...avatar)).equals(await crop(other.files[0].attachment, ...avatar)), 'avatar untouched by the message');
-  const panelRow = [r.message.panel.x + 30, r.message.panel.y + 20, r.message.panel.w - 60, 40];
-  assert.ok(!(await crop(png, ...panelRow)).equals(await crop(other.files[0].attachment, ...panelRow)), 'message text drawn in the panel');
-});
-
-test('/welcome-test and real joins use the same composition and saved settings', async () => {
-  const { guild, channels, members } = buildMockGuild();
-  const db = memDb();
-  const config = testConfig({ ownerId: guild.ownerId });
-  members.bob.displayAvatarURL = () => 'https://invalid.invalid/avatar.png';
-  setGuildSetting(db, guild.id, 'channels.welcome', channels.general.id);
-  setGuildSetting(db, guild.id, 'welcome.message', '**Welcome**, {name}!');
-  setGuildSetting(db, guild.id, 'welcome.tagline', 'JOINED THE ORDER');
-  const { getGuildSettings } = await import('../core/settings.js');
-  const preview = await composeWelcome(members.bob, { config, settings: getGuildSettings(db, guild.id), logger: memoryLogger(), fetchImpl: noNetwork });
-  await onMemberJoin(members.bob, { db, config, logger: memoryLogger() });
-  const real = channels.general.messages.at(-1);
-  assert.deepEqual(preview.card.message.lines, ['Welcome, Bob!']);
-  assert.ok(Buffer.compare(preview.files[0].attachment, real.files[0].attachment) === 0, 'byte-identical card');
 });
 
 test('message layout adapts: short text large, long text smaller and wrapped, huge text truncated — never overlapping', async () => {
@@ -240,18 +159,162 @@ test('message layout adapts: short text large, long text smaller and wrapped, hu
   assert.deepEqual(gif.message.lines, ['Animated hello']);
 });
 
-test('custom emoji in the message are fetched (bounded, from the Discord CDN only) and drawn', async () => {
-  const seen = [];
-  const emojiPng = await solidPng(64, 64, '#00ff00');
-  const fetchImpl = async (url) => {
-    seen.push(url);
-    return { ok: true, arrayBuffer: async () => emojiPng };
+// ------------------------------------------------------------------ welcome post: normal text + the original image below it
+
+/** A small 3-frame animated GIF (stands in for a server's uploaded animation). */
+function animatedGif() {
+  const enc = GIFEncoder();
+  const w = 64;
+  const h = 32;
+  for (const shade of [40, 140, 240]) {
+    const data = new Uint8ClampedArray(w * h * 4).map((_, k) => (k % 4 === 3 ? 255 : shade));
+    const palette = quantize(data, 16);
+    enc.writeFrame(applyPalette(data, palette), w, h, { palette, delay: 100, repeat: 0 });
+  }
+  enc.finish();
+  return Buffer.from(enc.bytes());
+}
+/** Frames in a GIF: one graphic-control extension block (21 F9 04) per frame. */
+function gifFrames(buf) {
+  const marker = Buffer.from([0x21, 0xf9, 0x04]);
+  let n = 0;
+  for (let at = buf.indexOf(marker); at !== -1; at = buf.indexOf(marker, at + 3)) n++;
+  return n;
+}
+
+/** Store an upload exactly as /setup welcome background: does (MOCK Discord CDN download). */
+async function upload(config, guildId, bytes, contentType) {
+  const fetchImpl = async () => ({ ok: true, status: 200, arrayBuffer: async () => bytes });
+  return saveGuildBackground(config, guildId, { contentType, size: bytes.length, url: 'https://cdn.discordapp.com/attachments/1/2/bg' }, { fetchImpl });
+}
+
+function welcomeEnv() {
+  const env = buildMockGuild();
+  const db = memDb();
+  const config = { ...testConfig({ ownerId: env.guild.ownerId }), dataDir: tempDir() };
+  setGuildSetting(db, env.guild.id, 'channels.welcome', env.channels.general.id);
+  return { ...env, db, config };
+}
+
+const VOIDWORKS_TEMPLATE = '🎉 Welcome to {server}, {mention}!\\n𓆩 Where Shadows Unite, Legends Awaken. 💜 𓆪';
+
+test('a real join sends the configured text as normal message content with the uploaded image unchanged below it', async () => {
+  const { guild, channels, members, db, config } = welcomeEnv();
+  const png = await solidPng(900, 300, '#5b21b6');
+  setGuildSetting(db, guild.id, 'welcome.background', await upload(config, guild.id, png, 'image/png'));
+  setGuildSetting(db, guild.id, 'welcome.message', VOIDWORKS_TEMPLATE);
+  const r = await onMemberJoin(members.john, { db, config, logger: memoryLogger() });
+  assert.deepEqual(r, { sent: true, withImage: true });
+  const msg = channels.general.messages.at(-1);
+  assert.equal(msg.content, `🎉 Welcome to ${guild.name}, <@${members.john.id}>!\n𓆩 Where Shadows Unite, Legends Awaken. 💜 𓆪`);
+  assert.equal(msg.files.length, 1, 'one message: text above, image attached below');
+  assert.equal(msg.files[0].name, 'welcome.png');
+  assert.ok(Buffer.compare(msg.files[0].attachment, png) === 0, 'byte-identical: nothing drawn on the image');
+  const img = await loadImage(msg.files[0].attachment);
+  assert.deepEqual([img.width, img.height], [900, 300], 'original dimensions kept');
+  assert.deepEqual(msg.allowedMentions, { parse: [], users: [members.john.id] }, 'only the new member can be pinged');
+});
+
+test('animated GIF welcome images stay animated (stored and sent byte-for-byte)', async () => {
+  const { guild, channels, members, db, config } = welcomeEnv();
+  const gif = animatedGif();
+  assert.equal(gifFrames(gif), 3);
+  const name = await upload(config, guild.id, gif, 'image/gif');
+  assert.equal(name, `${guild.id}.gif`);
+  setGuildSetting(db, guild.id, 'welcome.background', name);
+  await onMemberJoin(members.bob, { db, config, logger: memoryLogger() });
+  const sent = channels.general.messages.at(-1).files[0];
+  assert.equal(sent.name, 'welcome.gif');
+  assert.ok(Buffer.compare(sent.attachment, gif) === 0);
+  assert.equal(gifFrames(sent.attachment), 3, 'all frames present');
+  assert.equal(imageTypeOf(sent.attachment), 'gif');
+});
+
+test('/welcome-test sends exactly the same message as a real join (same builder, same saved settings)', async () => {
+  const { guild, channels, members, db, config } = welcomeEnv();
+  const gif = animatedGif();
+  setGuildSetting(db, guild.id, 'welcome.background', await upload(config, guild.id, gif, 'image/gif'));
+  setGuildSetting(db, guild.id, 'welcome.message', VOIDWORKS_TEMPLATE);
+  await onMemberJoin(members.john, { db, config, logger: memoryLogger() });
+  const real = channels.general.messages.at(-1);
+
+  const cmd = aegisCommands({ listener: null, music: null }).find((c) => c.data.name === 'welcome-test');
+  const replies = [];
+  const i = {
+    guild,
+    guildId: guild.id,
+    user: members.john.user,
+    options: { getUser: () => null },
+    deferReply: async () => {},
+    editReply: async (p) => replies.push(p),
+    followUp: async (p) => replies.push(p),
   };
-  const ids = Array.from({ length: 12 }, (_, i) => `<:e${i}:${String(100000000000000000n + BigInt(i))}>`).join(' ');
-  const images = await fetchMessageEmoji(`hi ${ids}`, { fetchImpl });
-  assert.equal(images.size, 8, 'at most 8 emoji downloads');
-  assert.ok(seen.every((u) => u.startsWith('https://cdn.discordapp.com/emojis/')));
-  const withImg = await renderWelcomePng({ displayName: 'A', message: '<:e0:100000000000000000>', emojiImages: images });
-  const without = await renderWelcomePng({ displayName: 'A', message: '<:e0:100000000000000000>' });
-  assert.notDeepEqual(withImg.buffer, without.buffer, 'emoji image drawn (fallback is :name: text)');
+  await cmd.execute(i, { config, db, logger: memoryLogger() });
+  const preview = replies[0];
+  assert.equal(preview.content, real.content, 'identical text');
+  assert.equal(preview.files.length, 1);
+  assert.equal(preview.files[0].name, real.files[0].name);
+  assert.ok(Buffer.compare(preview.files[0].attachment, real.files[0].attachment) === 0, 'identical image');
+  assert.deepEqual(preview.allowedMentions, { parse: [] }, 'the preview pings nobody');
+  assert.equal(replies.length, 1, 'no extra notes when everything is configured');
+  assert.doesNotMatch(JSON.stringify(replies), /shortened|too long|truncat/i, 'no image-text warnings any more');
+});
+
+test('/welcome-test points out missing settings privately, without changing the preview', async () => {
+  const { guild, members, db, config } = welcomeEnv();
+  setGuildSetting(db, guild.id, 'welcome.enabled', false);
+  const cmd = aegisCommands({ listener: null, music: null }).find((c) => c.data.name === 'welcome-test');
+  const replies = [];
+  const i = { guild, guildId: guild.id, user: members.john.user, options: { getUser: () => null }, deferReply: async () => {}, editReply: async (p) => replies.push(p), followUp: async (p) => replies.push(p) };
+  await cmd.execute(i, { config, db, logger: memoryLogger() });
+  assert.equal(replies[0].files.length, 0, 'no image configured: text only');
+  assert.match(replies[0].content, /Welcome to/);
+  assert.match(replies[1].content, /disabled/);
+  assert.match(replies[1].content, /No welcome image/);
+  assert.ok(replies[1].flags, 'notes are ephemeral');
+});
+
+test('welcome text is never truncated to fit an image and cannot mass-mention', async () => {
+  const { guild, channels, members, db, config } = welcomeEnv();
+  const long = `@everyone @here <@&${guild.id}> ${'Read the rules and grab your roles. '.repeat(25)}{mention}`;
+  setGuildSetting(db, guild.id, 'welcome.message', long);
+  await onMemberJoin(members.john, { db, config, logger: memoryLogger() });
+  const msg = channels.general.messages.at(-1);
+  assert.ok(msg.content.endsWith(`<@${members.john.id}>`), 'the full text is sent (well under the 2000-character limit)');
+  assert.deepEqual(msg.allowedMentions, { parse: [], users: [members.john.id] }, '@everyone, @here and roles are not pinged');
+  const huge = composeWelcome(members.john, { config, settings: { welcome: { message: 'x'.repeat(5000) }, channels: {} } });
+  assert.ok(huge.content.length <= 2000 && huge.content.endsWith('…'), 'Discord limit respected');
+});
+
+test('welcome image uploads: PNG/JPG/WebP/GIF identified by their bytes; other files refused; reset removes it', async () => {
+  const { guild, config } = welcomeEnv();
+  await assert.rejects(upload(config, guild.id, Buffer.from('not really an image at all'), 'image/png'), /PNG, JPG, WebP or GIF/);
+  await assert.rejects(upload(config, guild.id, animatedGif(), 'application/zip'), /PNG, JPG, WebP or GIF/);
+  const name = await upload(config, guild.id, animatedGif(), 'image/png'); // a GIF mislabelled as PNG keeps its real type
+  assert.equal(name, `${guild.id}.gif`);
+  removeGuildBackground(config, guild.id);
+  assert.equal(fs.existsSync(path.join(config.dataDir, 'backgrounds', name)), false);
+});
+
+test('join handler: disabled, invalid channel, and a failed image upload still greets with the text', async () => {
+  const { guild, channels, members, db, config } = welcomeEnv();
+  setGuildSetting(db, guild.id, 'welcome.enabled', false);
+  assert.equal((await onMemberJoin(members.john, { db, config, logger: memoryLogger() })).reason, 'disabled');
+  setGuildSetting(db, guild.id, 'welcome.enabled', true);
+  setGuildSetting(db, guild.id, 'channels.welcome', '999999999999999999');
+  assert.equal((await onMemberJoin(members.john, { db, config, logger: memoryLogger() })).reason, 'no_channel');
+  setGuildSetting(db, guild.id, 'channels.welcome', channels.general.id);
+  setGuildSetting(db, guild.id, 'welcome.background', await upload(config, guild.id, await solidPng(100, 50, '#000'), 'image/png'));
+  const realSend = channels.general.send.bind(channels.general);
+  let calls = 0;
+  channels.general.send = async (p) => {
+    calls++;
+    if (p.files?.length) throw new Error('Missing Permissions (Attach Files)');
+    return realSend(p);
+  };
+  const r = await onMemberJoin(members.john, { db, config, logger: memoryLogger() });
+  assert.deepEqual(r, { sent: true, withImage: false });
+  assert.equal(calls, 2);
+  assert.match(channels.general.messages.at(-1).content, /Welcome to/);
+  assert.equal(db.get(`SELECT COUNT(*) AS n FROM member_events WHERE type = 'join'`).n, 3);
 });

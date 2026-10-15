@@ -5,12 +5,13 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { MusicQueue } from '../features/music/queue.js';
 import { GuildMusic, MusicManager } from '../features/music/manager.js';
-import { matchQuality, rankForPlay, searchTracks, validateDirectUrl, searchLocal, resolveLink, parsePlaylistFile, matchScore, cleanVideoTitle, MusicError, describeTrack } from '../features/music/providers.js';
+import { matchQuality, rankForPlay, canonicalTitle, isPlayableTrack, streamInput, searchTracks, validateDirectUrl, searchLocal, resolveLink, parsePlaylistFile, matchScore, cleanVideoTitle, MusicError, describeTrack } from '../features/music/providers.js';
 import { memoryLogger } from '../core/logger.js';
 import { PermissionFlagsBits } from 'discord.js';
 import { enqueueTrack, targetVoiceChannel, musicHandlers } from '../apps/aegis/music.js';
 import { getAction } from '../core/actions/registry.js';
 import { validateParams } from '../core/actions/validate.js';
+import { detectFfmpeg } from '../features/music/audioEngine.js';
 import { memDb, tempDir, testConfig } from './helpers.js';
 
 /** MOCK voice layer: a player that emits the same state transitions as @discordjs/voice. */
@@ -78,7 +79,7 @@ function fakeAdapter({ failResource = new Set(), silent = new Set(), stall = new
       return p;
     },
     async createResource(track) {
-      if (failResource.has(track.title)) throw new MusicError('unavailable', `cannot open ${track.title}`);
+      if (failResource.has(track.title) || failResource.has(`${track.provider}:${track.title}`)) throw new MusicError('unavailable', `cannot open ${track.title}`);
       return { track, silent: silent.has(track.title), stall: stall.has(track.title), volume: { setVolume: (v) => a.volumes.push(v) } };
     },
     waitReconnect: async () => reconnect,
@@ -383,7 +384,7 @@ test('YouTube/Spotify links are metadata only: their audio is never used', async
   assert.equal(yt.tracks[0].provider, 'audius');
   assert.match(yt.note, /cannot be streamed into Discord/);
   assert.ok(!calls.some((u) => /googlevideo|youtube\.com\/watch/.test(u)), 'no YouTube media requests');
-  await assert.rejects(() => resolveLink('https://open.spotify.com/track/xyz', { config: cfg(), fetchImpl: router([[/open\.spotify\.com\/oembed/, { title: 'Unknown Mainstream Hit' }], [/audius/, { data: [] }], [/archive/, { response: { docs: [] } }]]).fetchImpl }), (e) => e.code === 'not_found' && /licensed source/.test(e.message));
+  await assert.rejects(() => resolveLink('https://open.spotify.com/track/xyz', { config: cfg(), fetchImpl: router([[/open\.spotify\.com\/oembed/, { title: 'Unknown Mainstream Hit' }], [/audius/, { data: [] }], [/archive/, { response: { docs: [] } }]]).fetchImpl }), (e) => e.code === 'not_found' && /not available from a source AEGIS may stream/.test(e.message));
   await assert.rejects(() => resolveLink('https://open.spotify.com/playlist/xyz', { config: cfg(), fetchImpl }), (e) => e.code === 'unsupported');
   assert.equal(cleanVideoTitle('Artist - Song (Official Music Video) [HD]'), 'Artist - Song');
 });
@@ -470,7 +471,7 @@ const audiusSearch = (tracks, itunes = []) =>
     [/api\.audius\.co\/v1\/tracks\/search/, { data: tracks }],
     [/itunes\.apple\.com\/search/, { results: itunes }],
   ]).fetchImpl;
-const itunesHit = (title, artist) => ({ trackId: 1, trackName: title, artistName: artist, trackTimeMillis: 200000, trackViewUrl: 'https://music.apple.com/x' });
+const itunesHit = (title, artist) => ({ trackId: 1, trackName: title, artistName: artist, trackTimeMillis: 200000, trackViewUrl: `https://music.apple.com/song/${encodeURIComponent(`${title}-${artist}`)}` });
 
 test('/play <query> searches and plays the best exact match at once — no picker, no follow-up question', async () => {
   const gm = gmFor({ adapter: fakeAdapter() });
@@ -580,4 +581,156 @@ test('empty or blank /play queries are rejected by validation, not by a follow-u
   assert.equal(validateParams(def.params, { query: '   ' }).ok, false);
   assert.equal(validateParams(def.params, { query: 'x' }).ok, true, 'any non-empty query is searched as-is');
   assert.equal('pick' in def.params, false, '/play has no picker mode');
+});
+
+// ------------------------------------------------------------------ source coverage, de-duplication, identity (MOCK HTTP)
+
+const ovItem = (id, title, creator, extra = {}) => ({
+  id, title, creator, source: 'jamendo', url: `https://prod-1.storage.jamendo.com/?trackid=${id}&format=mp32`, filetype: 'mp32', duration: 200000,
+  license: 'by-nc-sa', license_version: '3.0', foreign_landing_url: `https://www.jamendo.com/track/${id}`, ...extra,
+});
+const noFfmpeg = () => detectFfmpeg({ force: true, env: {}, run: () => ({ status: null, error: new Error('ENOENT') }) });
+
+test('Openverse: full CC tracks only — no sound-effect previews, no short clips, no formats this host cannot decode', async () => {
+  noFfmpeg();
+  try {
+    const { fetchImpl, calls } = router([[/api\.openverse\.org\/v1\/audio/, { results: [
+      ovItem('1001', 'River Song', 'Ana'),
+      ovItem('1002', 'Ringtone', 'Fx', { duration: 9000 }), // a clip
+      ovItem('1003', 'Door Slam', 'Fx', { source: 'freesound', url: 'https://cdn.freesound.org/previews/1/1-hq.mp3' }), // preview rendition
+      ovItem('1004', 'Sonata (Wikimedia)', 'Orchestra', { source: 'wikimedia_audio', url: 'https://upload.wikimedia.org/a.ogg', filetype: 'ogg' }), // needs FFmpeg
+      ovItem('1005', 'No Https', 'X', { url: 'http://insecure.example/a.mp3' }),
+    ] }]]);
+    const cfgOv = cfg({ providers: ['openverse'] });
+    const r = await searchTracks('river song ov1', { config: cfgOv, fetchImpl });
+    assert.deepEqual(r.weak.map((x) => x.title), ['River Song']);
+    const t1 = r.weak[0];
+    assert.equal(t1.input, 'https://prod-1.storage.jamendo.com/?trackid=1001&format=mp32');
+    assert.equal(t1.canonical, 'jamendo:1001');
+    assert.match(t1.license, /^CC BY-NC-SA 3\.0$/);
+    assert.match(describeTrack(t1), /Jamendo via Openverse/);
+    assert.match(calls[0], /source=jamendo,wikimedia_audio,ccmixter/);
+    await searchTracks('river song ov1', { config: cfgOv, fetchImpl });
+    assert.equal(calls.length, 1, 'repeat searches are cached (anonymous limit: 200/day)');
+  } finally {
+    detectFfmpeg({ force: true });
+  }
+});
+
+test('Openverse rate limits are reported, and other providers still answer', async () => {
+  const { fetchImpl } = router([
+    [/api\.openverse\.org/, {}, 429],
+    [/api\.audius\.co\/v1\/tracks\/search/, { data: [audiusTrackJson('a1', 'River Song', 'Ana')] }],
+  ]);
+  const r = await searchTracks('river song ov2', { config: cfg({ providers: ['audius', 'openverse'] }), fetchImpl });
+  assert.deepEqual(r.failed, [{ provider: 'Openverse', code: 'rate_limited' }]);
+  assert.equal(r.results[0].provider, 'audius');
+});
+
+test('duplicates are removed (provider id, canonical source, page URL, title + artist) and kept as fallbacks', async () => {
+  const jam = (id, name, artist) => ({ id, name, artist_name: artist, duration: 200, audio: `https://prod-1.storage.jamendo.com/?trackid=${id}&format=mp32`, shareurl: `https://www.jamendo.com/track/${id}` });
+  const { fetchImpl } = router([
+    [/api\.jamendo\.com/, { results: [jam('2001', 'Paper Boats', 'Lina')] }],
+    [/api\.openverse\.org/, { results: [ovItem('2001', 'Paper Boats', 'Lina'), ovItem('2002', 'Paper Boats', 'Lina')] }], // same Jamendo track + a re-upload
+    [/api\.audius\.co\/v1\/tracks\/search/, { data: [audiusTrackJson('a1', 'Paper Boats', 'Lina'), audiusTrackJson('a1', 'Paper Boats', 'Lina')] }],
+    [/itunes\.apple\.com/, { results: [itunesHit('Paper Boats', 'Lina'), { ...itunesHit('Paper Boats (From "Rivers")', 'Lina'), trackId: 2 }, { ...itunesHit('Paper Boats', 'Lina'), trackId: 3 }] }],
+  ]);
+  const r = await searchTracks('paper boats lina dup', { config: cfg({ providers: ['audius', 'jamendo', 'openverse'], jamendoClientId: 'free-id' }), fetchImpl, withMetadata: true });
+  const all = await searchTracks('paper boats lina', { config: cfg({ providers: ['audius', 'jamendo', 'openverse'], jamendoClientId: 'free-id' }), fetchImpl, withMetadata: true });
+  for (const res of [r, all]) {
+    assert.equal(res.weak.length, 1, 'one entry for one recording');
+    assert.equal(res.metadata.length, 1, 'catalogue duplicates (other albums / "From …" titles) collapse too');
+  }
+  const mirrors = all.weak[0].mirrors.map((m) => `${m.provider}:${m.id}`);
+  assert.ok(mirrors.length >= 2 && !mirrors.includes(`${all.weak[0].provider}:${all.weak[0].id}`), 'other copies kept as fallbacks, not as extra results');
+  assert.equal(canonicalTitle('Slow Motion (From "Bharat")'), 'Slow Motion');
+  assert.equal(canonicalTitle('Kesariya (Remix)'), 'Kesariya (Remix)', 'versions are not merged with the original');
+});
+
+test('metadata-only results can never enter the playable queue', async () => {
+  const meta = { provider: 'itunes', id: '1', title: 'Slow Motion', artist: 'Shreya Ghoshal & Nakash Aziz', playable: false, page: 'https://music.apple.com/x' };
+  assert.equal(isPlayableTrack(meta), false);
+  assert.equal(isPlayableTrack({ ...meta, provider: 'audius', playable: true, input: 'https://a/s.mp3' }), true);
+  assert.equal(isPlayableTrack({ provider: 'audius', title: 'artwork only', artwork: 'https://a/x.jpg' }), false, 'artwork/page URLs are not streams');
+  await assert.rejects(streamInput(meta), /metadata only/);
+  const gm = gmFor();
+  await assert.rejects(gm.enqueue(meta, { voiceChannelId: 'vc' }), /metadata only/);
+  assert.equal(gm.queue.current, null);
+  const r = await gm.enqueueMany([meta, t('real')], { voiceChannelId: 'vc' });
+  assert.equal(r.added, 1);
+  assert.equal(gm.queue.current.title, 'real');
+});
+
+test('/play never plays a different song that shares the title of a known recording (acceptance: /play Slow Motion)', async () => {
+  const gm = gmFor({ adapter: fakeAdapter() });
+  const catalogue = [itunesHit('Slow Motion', 'Shreya Ghoshal & Nakash Aziz'), { ...itunesHit('Slow Motion', 'Trey Songz'), trackId: 2 }, { ...itunesHit('Slow Motion', 'Third Eye Blind'), trackId: 3 }];
+  const uploads = [audiusTrackJson('s1', 'Slow Motion', 'DJ Somebody'), audiusTrackJson('s2', 'In Slow Motion', 'hela'), audiusTrackJson('s3', 'Slow Motion Rain', 'Twins')];
+  const res = await musicHandlers['music.play'](playCtx({ gm, fetchImpl: audiusSearch(uploads, catalogue) }), { query: 'Slow Motion' });
+  assert.equal(res.ok, false);
+  assert.match(res.message, /^🚫 \*\*Slow Motion\*\* by Shreya Ghoshal & Nakash Aziz, Trey Songz and other catalogue artists isn't available/);
+  assert.match(res.message, /"Slow Motion" by DJ Somebody \(Audius\)/, 'clearly identified alternative');
+  assert.match(res.message, /e\.g\. `\/play Slow Motion DJ Somebody`/);
+  assert.doesNotMatch(res.message, FOLLOW_UP);
+  assert.equal(gm.queue.current, null, 'nothing played');
+
+  // Asking for that artist plays it at once.
+  const ok = await musicHandlers['music.play'](playCtx({ gm, fetchImpl: audiusSearch(uploads, catalogue) }), { query: 'Slow Motion DJ Somebody' });
+  assert.match(ok.message, /^▶️ Now playing \*\*Slow Motion — DJ Somebody/);
+  // A credited artist's upload of the title plays directly.
+  const gm2 = gmFor({ guildId: 'g2', adapter: fakeAdapter() });
+  const credited = await musicHandlers['music.play'](playCtx({ gm: gm2, fetchImpl: audiusSearch([...uploads, audiusTrackJson('s4', 'Slow Motion', 'Nakash Aziz')], catalogue) }), { query: 'Slow Motion' });
+  assert.match(credited.message, /^▶️ Now playing \*\*Slow Motion — Nakash Aziz/);
+});
+
+test('mood/genre requests and classical works still play directly', async () => {
+  const gm = gmFor({ adapter: fakeAdapter() });
+  const mood = await musicHandlers['music.play'](
+    playCtx({ gm, fetchImpl: audiusSearch([audiusTrackJson('c1', 'chill lofi set', 'Lofi Army')], [itunesHit('Chill LoFi', 'Hip Hop Lofi')]) }),
+    { query: 'chill lofi' },
+  );
+  assert.match(mood.message, /^▶️ Now playing \*\*chill lofi set — Lofi Army/);
+  const gm2 = gmFor({ guildId: 'g2', adapter: fakeAdapter() });
+  const classical = await musicHandlers['music.play'](
+    playCtx({ gm: gm2, fetchImpl: audiusSearch([audiusTrackJson('m1', 'Moonlight Sonata', 'Sean Gill')], [{ ...itunesHit('Moonlight Sonata', 'London Philharmonic Orchestra'), primaryGenreName: 'Classical' }]) }),
+    { query: 'moonlight sonata' },
+  );
+  assert.match(classical.message, /^▶️ Now playing \*\*Moonlight Sonata — Sean Gill/, 'any performance of a classical work is that work');
+});
+
+test('a failed provider falls back to the same recording from another provider', async () => {
+  const gm = gmFor({ adapter: fakeAdapter({ failResource: new Set(['audius:Paper Boats']) }) });
+  const { fetchImpl } = router([
+    [/api\.audius\.co\/v1\/tracks\/search/, { data: [audiusTrackJson('a1', 'Paper Boats', 'Lina', { play_count: 5000 })] }],
+    [/api\.openverse\.org/, { results: [ovItem('3001', 'Paper Boats', 'Lina')] }],
+    [/itunes\.apple\.com/, { results: [] }],
+  ]);
+  const ctx = { ...playCtx({ gm, fetchImpl }), config: cfg({ providers: ['audius', 'openverse'] }) };
+  const res = await musicHandlers['music.play'](ctx, { query: 'Paper Boats Lina' });
+  assert.equal(res.ok, true);
+  assert.equal(gm.queue.current.provider, 'openverse');
+  assert.match(res.message, /^▶️ Now playing \*\*Paper Boats — Lina · Jamendo via Openverse\*\*.*another upload of the same song/s);
+  assert.match(res.message, /Couldn't play \*\*Paper Boats — Lina · Audius/);
+});
+
+test('a slow provider does not delay /play once others found a good match; its answer is cached for next time', async () => {
+  let ovCalls = 0;
+  const { fetchImpl: base } = router([[/api\.audius\.co\/v1\/tracks\/search/, { data: [audiusTrackJson('a1', 'Tide Lines', 'Mara')] }]]);
+  const fetchImpl = async (url, init) => {
+    if (!/openverse/.test(url)) return base(url, init);
+    ovCalls++;
+    await new Promise((r) => setTimeout(r, 150)); // a cold Openverse query
+    return { ok: true, status: 200, json: async () => ({ results: [ovItem('4001', 'Tide Lines', 'Mara')] }) };
+  };
+  const config = cfg({ providers: ['audius', 'openverse'] });
+  const t0 = Date.now();
+  const first = await searchTracks('tide lines mara slow', { config, fetchImpl, graceMs: 20 });
+  assert.ok(Date.now() - t0 < 140, 'did not wait for the slow provider');
+  assert.deepEqual(first.failed, [{ provider: 'Openverse', code: 'outage' }]);
+  assert.equal(first.results[0].provider, 'audius');
+  await new Promise((r) => setTimeout(r, 200));
+  const second = await searchTracks('tide lines mara slow', { config, fetchImpl, graceMs: 20 });
+  assert.equal(ovCalls, 1, 'the late answer was cached');
+  assert.deepEqual(second.failed, []);
+  const copies = [second.results[0], ...(second.results[0].mirrors ?? [])];
+  assert.ok(copies.some((x) => x.provider === 'openverse'), 'the Openverse copy is now available (as a fallback of the same recording)');
 });

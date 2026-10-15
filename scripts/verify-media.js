@@ -111,6 +111,17 @@ await check('Audius stream audio level (not silence)', async () => {
   return `rms ${level.toFixed(3)} over 2 s of decoded audio`;
 });
 
+await check('Openverse (CC) search + live full-track stream → Opus packets', async () => {
+  const config = getConfig();
+  const { results: found, failed } = await searchTracks('ambient piano', { config: { ...config, music: { ...config.music, providers: ['openverse'] } } });
+  if (!found.length) throw new Error(`no Openverse results${failed.length ? ` (${failed[0].code})` : ''}`);
+  const track = found[0];
+  const p = await createPlayableStream(await streamInput(track), { ffmpeg });
+  const resource = createAudioResource(p.stream, { inputType: p.inputType, inlineVolume: true });
+  const packets = await readOpusPackets(resource, 50, 30000);
+  return `"${track.title}" by ${track.artist} (${track.license}, ${track.source}, ${Math.round(track.durationMs / 1000)} s) · ${p.format} via ${p.engine} → ${packets.length} Opus packets`;
+});
+
 await check('Internet Archive licensed search + live stream', async () => {
   const found = await searchArchive('moonlight sonata');
   if (!found.length) throw new Error('no licensed results');

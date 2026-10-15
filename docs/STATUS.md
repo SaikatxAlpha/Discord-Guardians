@@ -1,5 +1,47 @@
 # Implementation status
 
+## Welcome messages + music coverage (2026-10-15)
+
+**Welcome — root cause.** The uploaded background was never sent as uploaded:
+- It was redrawn into a 1200×500 "card" with the avatar, name, tagline and the message painted on, so long text was shortened.
+- GIF uploads were rejected outright.
+- Real joins sent only the mention as text.
+
+**Welcome — now.**
+- A welcome is one normal Discord message: the configured text as message content, with the server's image attached **byte-for-byte** below it. Size, format and GIF animation are all kept.
+- Real joins and `/welcome-test` use the same `composeWelcome`.
+- Only the new member can be pinged.
+- If the image can't be attached, the text is still sent.
+- `/setup welcome` lost the obsolete `format` and `tagline` options and now accepts GIFs. Saved settings are untouched.
+
+**Music — root causes.**
+- Effective providers were only Audius and the Archive: Jamendo had no client ID and radio was off.
+- Apple catalogue duplicates weren't merged.
+- Title-only requests could play an unrelated same-named song.
+
+**Music — now.**
+- **Openverse** added (no key needed): full-length Creative Commons tracks from Jamendo, Wikimedia Commons and ccMixter.
+- Results are de-duplicated, and duplicates are kept as same-recording fallbacks.
+- **Catalogue identity rule:** an upload with a known commercial title only plays if a credited artist made it.
+- Cross-provider fallback; metadata-only results are blocked at the queue.
+- A slow provider no longer delays `/play`.
+- See [MUSIC.md](MUSIC.md) for the provider audit, including why JioSaavn, Gaana, YouTube and Spotify can't be used.
+
+**Evidence (this PC)**
+
+| Check | Result |
+|---|---|
+| `npm test` / lint | **155 / 155 pass**, lint clean |
+| `register --dry-run` | KNIGHT 14, AEGIS 41 commands; no duplicates |
+| `smoke:login` | both bots log in with the new code |
+| `verify:media -- --builtin` (live, no FFmpeg) | Audius, **Openverse (Jamendo full track)** and Internet Archive streams → built-in MP3 decoder → Opus packets; stream cleanup |
+| Live `/play` selection | "Slow Motion" → clear "unavailable" message naming Shreya Ghoshal & Nakash Aziz, with labelled alternatives; "moonlight sonata", "chill lofi", "bollywood" → play |
+| **Audible playback in a real Discord voice channel** | **Not verified** |
+
+---
+
+## Earlier status
+
 ## Welcome cards + Jockie-style music (2026-10-14)
 
 **Root causes fixed**
